@@ -1,0 +1,9 @@
+node_modules
+dist
+/public/*
+!/public/data/
+scripts/.cache
+.DS_Store
+*.local
+*.zip
+*.tsbuildinfo

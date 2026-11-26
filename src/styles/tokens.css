@@ -1,0 +1,45 @@
+:root {
+  --font-display: 'Silkscreen', monospace;
+  --font-mono: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  --bg-deep: #071020;
+  --surface-card: rgba(11, 22, 43, 0.92);
+  --surface-card-solid: #0b162b;
+  --surface-modal: #0b1528;
+  --surface-input: #081021;
+
+  --border-dim: #1e3556;
+  --border-bright: #335b88;
+
+  --cyan: #38d6ff;
+  --cyan-glow: rgba(56, 214, 255, 0.35);
+  --pink: #e84e7c;
+  --pink-hover: #f35e8c;
+  --amber: #f59e0b;
+  --gold: #fde047;
+  --green: #34d399;
+
+  --text-primary: #eef6ff;
+  --text-secondary: #9bb4d4;
+  --text-muted: #6c86a8;
+
+  --tier-miss: #64748b;
+  --tier-plankton: #93c5fd;
+  --tier-tooclever: #f59e0b;
+  --tier-schooler: #38bdf8;
+  --tier-rare: #a855f7;
+  --tier-deepcut: #ec4899;
+  --tier-krillion: #fde047;
+}
+
+body.colorblind {
+  --text-secondary: #cde2fa;
+  --text-muted: #93b3db;
+  --tier-miss: #94a3b8;
+  --tier-plankton: #56b4e9;
+  --tier-tooclever: #e69f00;
+  --tier-schooler: #0072b2;
+  --tier-rare: #cc79a7;
+  --tier-deepcut: #d55e00;
+  --tier-krillion: #f0e442;
+}
