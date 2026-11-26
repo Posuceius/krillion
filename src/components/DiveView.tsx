@@ -1,14 +1,15 @@
 /**
- * Owns active dive gameplay phases (countdown, 25s timer, input matching, descent, round results).
+ * Owns active dive gameplay phases (countdown, 25s timer, input matching, animated depth plunge, round results).
  * Does not fetch prompt chunks or store completed runs in localStorage directly.
  */
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { soundEngine } from '../audio/soundEngine';
+import type { DescentVisualState } from '../art/OceanCanvas';
 import { TIER_SPRITES } from '../art/pixelSprites';
 import { PixelSpriteSvg } from '../art/PixelSpriteSvg';
 import { buildPromptIndex, matchPromptAnswer } from '../domain/matcher';
 import { calculateTotals } from '../domain/scoring';
-import { TIERS } from '../domain/tiers';
+import { ACCEPTED_TIER_ORDER, TIERS } from '../domain/tiers';
 import type {
   BuddyId,
   DiveMode,
@@ -16,6 +17,7 @@ import type {
   MatchResult,
   Prompt,
   RoundResult,
+  TierId,
   UserSettings,
 } from '../domain/types';
 import { DepthRuler } from './DepthRuler';
@@ -24,6 +26,16 @@ import { DiveSummary } from './DiveSummary';
 type DivePhase = 'countdown' | 'answering' | 'descending' | 'round_result' | 'summary';
 
 const ROUND_SECONDS = 25;
+
+const DESCENT_DURATION_MS: Record<TierId, number> = {
+  miss: 750,
+  plankton: 950,
+  tooclever: 1350,
+  schooler: 1800,
+  rare: 2300,
+  deepcut: 2700,
+  krillion: 3100,
+};
 
 interface DiveViewProps {
   mode: DiveMode;
@@ -40,6 +52,7 @@ interface DiveViewProps {
   onProgress?: (rounds: RoundResult[], currentIndex: number) => void;
   onComplete: (run: DiveRunRecord) => BuddyId[];
   onDepthChange: (depth: number) => void;
+  onDescentVisualChange?: (state: DescentVisualState | null) => void;
   onPlayAgain?: () => void;
   playAgainLabel?: string;
   onGoHome: () => void;
@@ -61,6 +74,7 @@ export function DiveView({
   onProgress,
   onComplete,
   onDepthChange,
+  onDescentVisualChange,
   onPlayAgain,
   playAgainLabel,
   onGoHome,
@@ -79,6 +93,10 @@ export function DiveView({
   const [pendingCorrection, setPendingCorrection] = useState<MatchResult | null>(null);
   const [latestRound, setLatestRound] = useState<RoundResult | null>(null);
 
+  const [plungeDepth, setPlungeDepth] = useState<number>(() => calculateTotals(initialRounds).totalDepth);
+  const [crossedTier, setCrossedTier] = useState<TierId>('miss');
+  const plungeRafRef = useRef<number | null>(null);
+
   const inputRef = useRef<HTMLInputElement | null>(null);
   const activePrompt = prompts[currentIndex];
   const promptIndex = useMemo(
@@ -86,16 +104,27 @@ export function DiveView({
     [activePrompt]
   );
 
-  const { totalScore, totalDepth } = useMemo(() => {
+  const settledTotals = useMemo(() => {
     if (finishedRun) {
       return { totalScore: finishedRun.totalScore, totalDepth: finishedRun.totalDepth };
     }
     return calculateTotals(rounds);
   }, [finishedRun, rounds]);
 
+  const displayedDepth = phase === 'descending' ? Math.round(plungeDepth) : settledTotals.totalDepth;
+
   useEffect(() => {
-    onDepthChange(totalDepth);
-  }, [totalDepth, onDepthChange]);
+    onDepthChange(displayedDepth);
+  }, [displayedDepth, onDepthChange]);
+
+  useEffect(() => {
+    return () => {
+      if (plungeRafRef.current !== null) {
+        window.cancelAnimationFrame(plungeRafRef.current);
+      }
+      onDescentVisualChange?.(null);
+    };
+  }, [onDescentVisualChange]);
 
   // Countdown phase: 3 -> 2 -> 1 -> answering
   useEffect(() => {
@@ -127,7 +156,6 @@ export function DiveView({
     };
   }, [phase, currentIndex]);
 
-  // Autofocus input when answering starts
   useEffect(() => {
     if (phase === 'answering') {
       inputRef.current?.focus();
@@ -166,7 +194,10 @@ export function DiveView({
   }, [phase, currentIndex]);
 
   const finalizeRound = (result: RoundResult) => {
+    const startDepth = calculateTotals(rounds).totalDepth;
+    const endDepth = startDepth + result.depthMeters;
     const nextRounds = [...rounds, result];
+
     setRounds(nextRounds);
     setLatestRound(result);
     setPendingCorrection(null);
@@ -181,10 +212,53 @@ export function DiveView({
     const nextIdx = currentIndex + 1;
     onProgress?.(nextRounds, Math.min(nextIdx, prompts.length - 1));
 
+    setPlungeDepth(startDepth);
+    setCrossedTier(result.tier === 'miss' ? 'miss' : 'plankton');
     setPhase('descending');
-    window.setTimeout(() => {
-      setPhase('round_result');
-    }, settings.lowPowerMode ? 450 : 1250);
+    onDescentVisualChange?.({
+      active: true,
+      startDepth,
+      targetDepth: endDepth,
+      tier: result.tier,
+    });
+
+    const duration = settings.lowPowerMode ? 450 : DESCENT_DURATION_MS[result.tier];
+    const tStart = performance.now();
+    let lastPingIdx = -1;
+
+    const stepPlunge = (now: number) => {
+      const t = Math.min(1, (now - tStart) / duration);
+      // Cubic ease-out for satisfying plunge deceleration
+      const eased = 1 - Math.pow(1 - t, 3);
+      const curr = startDepth + (endDepth - startDepth) * eased;
+      setPlungeDepth(curr);
+
+      const gained = curr - startDepth;
+      let latestTier: TierId = result.tier === 'miss' ? 'miss' : 'plankton';
+      for (let i = 0; i < ACCEPTED_TIER_ORDER.length; i++) {
+        const tid = ACCEPTED_TIER_ORDER[i];
+        if (gained >= TIERS[tid].depthMeters - 1 && TIERS[tid].depthMeters <= result.depthMeters) {
+          latestTier = tid;
+          if (i > lastPingIdx) {
+            lastPingIdx = i;
+            if (i > 0) soundEngine.thresholdPing(i);
+          }
+        }
+      }
+      setCrossedTier(latestTier);
+
+      if (t < 1) {
+        plungeRafRef.current = window.requestAnimationFrame(stepPlunge);
+      } else {
+        setPlungeDepth(endDepth);
+        window.setTimeout(() => {
+          onDescentVisualChange?.(null);
+          setPhase('round_result');
+        }, settings.lowPowerMode ? 120 : 340);
+      }
+    };
+
+    plungeRafRef.current = window.requestAnimationFrame(stepPlunge);
   };
 
   const acceptMatch = (match: MatchResult) => {
@@ -267,7 +341,6 @@ export function DiveView({
     setPhase('countdown');
   };
 
-  // Allow Enter key in round_result to descend to next prompt
   useEffect(() => {
     if (phase !== 'round_result') return;
     const onKey = (e: KeyboardEvent) => {
@@ -305,7 +378,7 @@ export function DiveView({
         <div className="hud-stat">
           <div className="hud-stat-label">DEPTH</div>
           <div className="hud-stat-value" style={{ color: 'var(--cyan)' }}>
-            {totalDepth}m
+            {displayedDepth}m
           </div>
         </div>
 
@@ -341,13 +414,13 @@ export function DiveView({
         <div className="hud-stat" style={{ textAlign: 'right' }}>
           <div className="hud-stat-label">SCORE</div>
           <div className="hud-stat-value" style={{ color: 'var(--pink)' }}>
-            {totalScore}
+            {settledTotals.totalScore}
           </div>
         </div>
       </div>
 
       {/* Depth Ruler */}
-      <DepthRuler currentDepth={totalDepth} />
+      <DepthRuler currentDepth={displayedDepth} />
 
       {/* Center Stage */}
       <div
@@ -363,24 +436,14 @@ export function DiveView({
         }}
       >
         {phase === 'countdown' && (
-          <div
-            className="pixel-box"
-            style={{
-              marginTop: 32,
-              padding: '28px 20px',
-              textAlign: 'center',
-            }}
-          >
+          <div className="pixel-box" style={{ marginTop: 32, padding: '28px 20px', textAlign: 'center' }}>
             <div className="pixel-label" style={{ fontSize: 11, color: 'var(--cyan)' }}>
               {label} · PROMPT {currentIndex + 1} OF {prompts.length}
             </div>
             <div style={{ fontSize: 13, color: 'var(--text-secondary)', marginTop: 14 }}>
               descending · the clock starts in
             </div>
-            <div
-              className="krillion-title"
-              style={{ fontSize: 56, marginTop: 10 }}
-            >
+            <div className="krillion-title" style={{ fontSize: 56, marginTop: 10 }}>
               {countdownNum}
             </div>
             <button
@@ -401,10 +464,7 @@ export function DiveView({
         {phase === 'answering' && activePrompt && (
           <>
             <div className="pixel-box" style={{ padding: '18px 18px 16px' }}>
-              <div
-                className="pixel-label"
-                style={{ fontSize: 11, color: 'var(--pink)', marginBottom: 8 }}
-              >
+              <div className="pixel-label" style={{ fontSize: 11, color: 'var(--pink)', marginBottom: 8 }}>
                 PROMPT {currentIndex + 1} OF {prompts.length}
               </div>
               <div
@@ -417,14 +477,7 @@ export function DiveView({
               >
                 {activePrompt.text}
               </div>
-              <div
-                style={{
-                  marginTop: 10,
-                  fontSize: 11,
-                  color: 'var(--text-muted)',
-                  letterSpacing: '0.06em',
-                }}
-              >
+              <div style={{ marginTop: 10, fontSize: 11, color: 'var(--text-muted)', letterSpacing: '0.06em' }}>
                 ▼ rarer answers sink deeper ▼
               </div>
             </div>
@@ -433,12 +486,7 @@ export function DiveView({
               {rejectedText && (
                 <div
                   role="status"
-                  style={{
-                    color: 'var(--amber)',
-                    fontSize: 12,
-                    marginBottom: 8,
-                    textAlign: 'center',
-                  }}
+                  style={{ color: 'var(--amber)', fontSize: 12, marginBottom: 8, textAlign: 'center' }}
                 >
                   {rejectedText}
                 </div>
@@ -458,10 +506,7 @@ export function DiveView({
                 >
                   <div style={{ fontSize: 12 }}>
                     <span style={{ color: 'var(--text-secondary)' }}>Did you mean </span>
-                    <strong style={{ color: 'var(--cyan)' }}>
-                      "{pendingCorrection.canonical}"
-                    </strong>
-                    ?
+                    <strong style={{ color: 'var(--cyan)' }}>"{pendingCorrection.canonical}"</strong>?
                   </div>
                   <div style={{ display: 'flex', gap: 6 }}>
                     <button
@@ -487,13 +532,8 @@ export function DiveView({
                 </div>
               )}
 
-              <form
-                onSubmit={handleSubmit}
-                style={{ display: 'flex', alignItems: 'center', gap: 8 }}
-              >
-                <div className={`timer-ring ${secondsLeft <= 5 ? 'urgent' : ''}`}>
-                  {secondsLeft}
-                </div>
+              <form onSubmit={handleSubmit} style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <div className={`timer-ring ${secondsLeft <= 5 ? 'urgent' : ''}`}>{secondsLeft}</div>
 
                 <div style={{ flex: 1 }}>
                   <input
@@ -519,13 +559,7 @@ export function DiveView({
                       outline: 'none',
                     }}
                   />
-                  <div
-                    style={{
-                      height: 4,
-                      background: 'rgba(30, 53, 86, 0.7)',
-                      marginTop: 4,
-                    }}
-                  >
+                  <div style={{ height: 4, background: 'rgba(30, 53, 86, 0.7)', marginTop: 4 }}>
                     <div
                       style={{
                         height: '100%',
@@ -537,11 +571,7 @@ export function DiveView({
                   </div>
                 </div>
 
-                <button
-                  type="submit"
-                  className="btn-pixel btn-pink"
-                  style={{ height: 52, padding: '0 16px' }}
-                >
+                <button type="submit" className="btn-pixel btn-pink" style={{ height: 52, padding: '0 16px' }}>
                   DIVE
                 </button>
               </form>
@@ -549,9 +579,47 @@ export function DiveView({
           </>
         )}
 
-        {(phase === 'descending' || phase === 'round_result') && latestRound && (
+        {phase === 'descending' && latestRound && (
           <div
-            className="pixel-box-cyan"
+            style={{
+              flex: 1,
+              display: 'flex',
+              flexDirection: 'column',
+              alignItems: 'center',
+              justifyContent: 'center',
+              gap: 14,
+              pointerEvents: 'none',
+            }}
+          >
+            <div
+              key={crossedTier}
+              className="tier-crossed-banner"
+              style={{ color: tierColor(crossedTier) }}
+            >
+              <PixelSpriteSvg sprite={TIER_SPRITES[crossedTier]} size={22} />
+              <span>
+                {TIERS[crossedTier].label} · {TIERS[crossedTier].points} PTS
+              </span>
+            </div>
+
+            <div className="plunge-pill" style={{ borderColor: tierColor(crossedTier) }}>
+              <span>
+                {latestRound.canonicalAnswer
+                  ? `"${latestRound.canonicalAnswer.toUpperCase()}"`
+                  : 'TIME UP'}
+              </span>
+              <span style={{ color: 'var(--cyan)' }}>▼</span>
+            </div>
+
+            <div className="pixel-label" style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
+              SINKING... {displayedDepth}m
+            </div>
+          </div>
+        )}
+
+        {phase === 'round_result' && latestRound && (
+          <div
+            className="pixel-box-cyan result-card-enter"
             style={{
               marginTop: 28,
               padding: 20,
@@ -563,24 +631,11 @@ export function DiveView({
               <PixelSpriteSvg sprite={TIER_SPRITES[latestRound.tier]} size={56} />
             </div>
 
-            <div
-              className="pixel-label"
-              style={{
-                fontSize: 18,
-                color: tierColor(latestRound.tier),
-              }}
-            >
+            <div className="pixel-label" style={{ fontSize: 18, color: tierColor(latestRound.tier) }}>
               {TIERS[latestRound.tier].label}
             </div>
 
-            <div
-              style={{
-                fontSize: 20,
-                fontWeight: 700,
-                color: '#ffffff',
-                marginTop: 8,
-              }}
-            >
+            <div style={{ fontSize: 20, fontWeight: 700, color: '#ffffff', marginTop: 8 }}>
               {latestRound.canonicalAnswer
                 ? `"${latestRound.canonicalAnswer}"`
                 : latestRound.timedOut
@@ -588,40 +643,22 @@ export function DiveView({
                   : 'NO ECHO'}
             </div>
 
-            <div
-              className="pixel-label"
-              style={{
-                fontSize: 13,
-                color: 'var(--cyan)',
-                marginTop: 8,
-              }}
-            >
+            <div className="pixel-label" style={{ fontSize: 13, color: 'var(--cyan)', marginTop: 8 }}>
               +{latestRound.points} PTS · SINK {latestRound.depthMeters}M
             </div>
 
-            <p
-              style={{
-                fontSize: 12,
-                color: 'var(--text-secondary)',
-                marginTop: 10,
-                marginBottom: phase === 'round_result' ? 18 : 0,
-              }}
-            >
+            <p style={{ fontSize: 12, color: 'var(--text-secondary)', marginTop: 10, marginBottom: 18 }}>
               {TIERS[latestRound.tier].flavor}
             </p>
 
-            {phase === 'round_result' && (
-              <button
-                type="button"
-                className="btn-pixel btn-primary-cyan"
-                style={{ width: '100%' }}
-                onClick={handleAdvance}
-              >
-                {currentIndex + 1 >= prompts.length
-                  ? 'VIEW DIVE SUMMARY ▼'
-                  : 'DESCEND ▼'}
-              </button>
-            )}
+            <button
+              type="button"
+              className="btn-pixel btn-primary-cyan"
+              style={{ width: '100%' }}
+              onClick={handleAdvance}
+            >
+              {currentIndex + 1 >= prompts.length ? 'VIEW DIVE SUMMARY ▼' : 'DESCEND ▼'}
+            </button>
           </div>
         )}
       </div>

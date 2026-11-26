@@ -1,5 +1,5 @@
 /**
- * Owns automated integrity checks across all 64 static prompt chunks and manifest metadata.
+ * Owns automated integrity checks across all 128 static prompt chunks, Bonaire/island coverage, and manifest metadata.
  * Does not mutate repository data or run in production bundles.
  */
 import { readFileSync, statSync } from 'node:fs';
@@ -21,10 +21,12 @@ import {
   type RawPromptEntry,
 } from './index';
 
+const NUM_CHUNKS = 128;
+
 function loadAllChunksFromDisk(): Record<number, Record<string, RawPromptEntry>> {
   const chunks: Record<number, Record<string, RawPromptEntry>> = {};
-  for (let cid = 0; cid < 64; cid++) {
-    const fileNum = String(cid).padStart(2, '0');
+  for (let cid = 0; cid < NUM_CHUNKS; cid++) {
+    const fileNum = String(cid).padStart(3, '0');
     const filePath = resolve(
       process.cwd(),
       'public',
@@ -37,26 +39,26 @@ function loadAllChunksFromDisk(): Record<number, Record<string, RawPromptEntry>>
   return chunks;
 }
 
-describe('prompt catalog integrity (full-year 2,555+ prompts)', () => {
-  it('covers at least 365 non-repeating daily dives (>= 2,555 unique prompts)', () => {
-    expect(PROMPT_MANIFEST.length).toBeGreaterThanOrEqual(2555);
-    expect(YEAR_COVERAGE_DAYS).toBeGreaterThanOrEqual(365);
+describe('prompt catalog integrity (expanded 3,400+ prompts)', () => {
+  it('covers 485+ non-repeating daily dives (>= 3,400 unique prompts)', () => {
+    expect(PROMPT_MANIFEST.length).toBeGreaterThanOrEqual(3400);
+    expect(YEAR_COVERAGE_DAYS).toBeGreaterThanOrEqual(485);
 
     const ids = new Set(PROMPT_MANIFEST.map((p) => p.id));
     const texts = new Set(PROMPT_MANIFEST.map((p) => p.text.toLowerCase()));
     expect(ids.size).toBe(PROMPT_MANIFEST.length);
     expect(texts.size).toBe(PROMPT_MANIFEST.length);
-    expect(TOTAL_ANSWER_COUNT).toBeGreaterThanOrEqual(350_000);
+    expect(TOTAL_ANSWER_COUNT).toBeGreaterThanOrEqual(650_000);
   });
 
-  it('validates all 64 chunk files (every prompt has 6 tiers, >= 30 answers, zero collisions)', () => {
+  it('validates all 128 chunk files (every prompt has 6 tiers, >= 30 answers, zero collisions)', () => {
     const chunks = loadAllChunksFromDisk();
     const errors: string[] = [];
     let summedAnswers = 0;
 
     let totalChunkBytes = 0;
-    for (let cid = 0; cid < 64; cid++) {
-      const fileNum = String(cid).padStart(2, '0');
+    for (let cid = 0; cid < NUM_CHUNKS; cid++) {
+      const fileNum = String(cid).padStart(3, '0');
       const filePath = resolve(
         process.cwd(),
         'public',
@@ -66,7 +68,7 @@ describe('prompt catalog integrity (full-year 2,555+ prompts)', () => {
       );
       totalChunkBytes += statSync(filePath).size;
     }
-    expect(totalChunkBytes).toBeLessThan(25 * 1024 * 1024);
+    expect(totalChunkBytes).toBeLessThan(35 * 1024 * 1024);
 
     for (const meta of PROMPT_MANIFEST) {
       const chunkPayload = chunks[meta.chunk];
@@ -120,6 +122,30 @@ describe('prompt catalog integrity (full-year 2,555+ prompts)', () => {
 
     expect(errors).toEqual([]);
     expect(summedAnswers).toBe(TOTAL_ANSWER_COUNT);
+  });
+
+  it('includes Bonaire, Aruba, and Curacao across island and archipelago prompts', () => {
+    const chunks = loadAllChunksFromDisk();
+    for (const pid of ['geo-island', 'geo-archipelago']) {
+      const meta = PROMPT_META_BY_ID[pid];
+      expect(meta).toBeDefined();
+      const prompt = parsePromptJson(meta, chunks[meta.chunk][pid]);
+      const idx = buildPromptIndex(prompt);
+      for (const ans of ['Bonaire', 'Aruba', 'Curaçao']) {
+        const res = matchPromptAnswer(prompt, ans, idx);
+        expect(res.kind).not.toBe('no_echo');
+      }
+    }
+
+    const bMeta = PROMPT_META_BY_ID['geo-island-ltr-b'];
+    expect(bMeta).toBeDefined();
+    const bPrompt = parsePromptJson(bMeta, chunks[bMeta.chunk][bMeta.id]);
+    expect(matchPromptAnswer(bPrompt, 'Bonaire').kind).not.toBe('no_echo');
+
+    const aMeta = PROMPT_META_BY_ID['geo-island-ltr-a'];
+    expect(aMeta).toBeDefined();
+    const aPrompt = parsePromptJson(aMeta, chunks[aMeta.chunk][aMeta.id]);
+    expect(matchPromptAnswer(aPrompt, 'Aruba').kind).not.toBe('no_echo');
   });
 
   it('indexes and matches the largest enriched prompt quickly (< 100ms)', () => {

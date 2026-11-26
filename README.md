@@ -4,7 +4,7 @@ A 100% static, zero-backend single-player version of **Krillion ("The Daily Dive
 
 ## Included Features
 
-- **Daily Dive**: 7 prompts per day, 25 seconds per prompt, resetting at midnight Eastern Time (`America/New_York`). Uses a deterministic permutation cycle across **2,567 prompts** (**366 consecutive days** with zero repeated prompts) and **420,651 answers**.
+- **Daily Dive**: 7 prompts per day, 25 seconds per prompt, resetting at midnight Eastern Time (`America/New_York`). Uses a deterministic permutation cycle across **3,404 prompts** (**486 consecutive days** with zero repeated prompts) and **729,758 answers**.
 - **6 Rarity Tiers & Depth Scoring**: `Plankton` (5 pts / 50m), `Too Clever` (15 pts / 150m), `Schooler` (30 pts / 300m), `Rare` (60 pts / 600m), `Deep Cut` (85 pts / 850m), and `One in a Krillion` (100 pts / 1,000m), up to 7,000m in the Hadal Zone.
 - **All Single-Player Modes Free & Unlocked**:
   - **Archive** (`#/archive`): Replay past Daily Dives from `#1` up to yesterday.
@@ -68,7 +68,7 @@ npm run preview  # Preview the production build locally
 
 ## Updating or Expanding the Prompt Database
 
-All 2,567 prompts and 420,651 answers are stored as 64 static JSON chunks under `public/data/chunks/chunk-00.json` through `chunk-63.json`, indexed by `src/data/manifest.ts`.
+All 3,404 prompts and 729,758 answers are stored as 128 static JSON chunks under `public/data/chunks/chunk-000.json` through `chunk-127.json`, indexed by `src/data/manifest.ts`.
 
 To regenerate or customize the dataset (requires Python 3):
 - Edit `scripts/seed_prompts.json` or `scripts/build_year_database.py`.

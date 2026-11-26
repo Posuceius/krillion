@@ -74,6 +74,12 @@ class RetroSoundEngine {
     this.playTone(880, 0.045, 'square', 0.035);
   }
 
+  public thresholdPing(tierIndex: number): void {
+    const freqs = [330, 415, 523, 659, 880, 1175];
+    const f = freqs[Math.max(0, Math.min(freqs.length - 1, tierIndex))];
+    this.playTone(f, 0.11, 'triangle', 0.055, 0, f * 1.15);
+  }
+
   public rejectBuzz(): void {
     this.playTone(170, 0.11, 'sawtooth', 0.055, 0, 120);
     this.playTone(135, 0.12, 'sawtooth', 0.05, 0.08, 95);

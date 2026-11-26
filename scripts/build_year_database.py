@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """
-Build a 2,600+ prompt Krillion database (365+ consecutive non-repeating days)
+Build a 3,600+ prompt Krillion database (500+ consecutive non-repeating days)
 from:
-  1. All 159 existing curated + Wikidata-enriched prompts (public/data/prompts & seed_prompts.json)
-  2. Letter-slices of large existing enriched prompts
-  3. Fast cached master Wikidata SPARQL datasets sliced by country/state/year/decade/genre/letter
+  1. All 159 core curated & Wikidata-enriched prompts (with island/archipelago & movie fixes)
+  2. Letter-slices of large core & master Wikidata pools
+  3. Fast cached master Wikidata SPARQL datasets (TV, anime, manga, songs, video games,
+     movies by genre/decade/country, Americas/world cities, rivers, sports, science, nature,
+     history, companies, foods)
   4. Rich English wordcraft prompts derived from /usr/share/dict/ + Norvig 333k word frequencies
 
 Outputs:
-  - public/data/chunks/chunk-00.json .. chunk-63.json (64 deterministic chunks)
+  - public/data/chunks/chunk-000.json .. chunk-127.json (128 deterministic chunks)
   - src/data/manifest.ts (PROMPT_MANIFEST, TOTAL_ANSWER_COUNT, YEAR_COVERAGE_DAYS, THEMED_PACKS)
 """
 
@@ -23,7 +25,7 @@ import time
 import unicodedata
 import urllib.parse
 import urllib.request
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
@@ -31,19 +33,175 @@ ROOT = Path(__file__).resolve().parent.parent
 SEED_PATH = ROOT / "scripts" / "seed_prompts.json"
 CACHE_DIR = ROOT / "scripts" / ".cache"
 MASTER_CACHE = CACHE_DIR / "master"
+ENRICHED_159_DIR = CACHE_DIR / "enriched_159"
 WORD_FREQ_PATH = CACHE_DIR / "word_freq.txt"
 OLD_PROMPTS_DIR = ROOT / "public" / "data" / "prompts"
-ENRICHED_159_DIR = CACHE_DIR / "enriched_159"
 OUT_CHUNKS_DIR = ROOT / "public" / "data" / "chunks"
 OUT_MANIFEST_PATH = ROOT / "src" / "data" / "manifest.ts"
 
-NUM_CHUNKS = 64
+NUM_CHUNKS = 128
 TIERS = ["plankton", "tooclever", "schooler", "rare", "deepcut", "krillion"]
 SPARQL_ENDPOINT = "https://query.wikidata.org/sparql"
-USER_AGENT = "KrillionStaticBuilder/1.1 (https://gitlab.com; static-pages-game)"
+USER_AGENT = "KrillionStaticBuilder/1.2 (https://gitlab.com; static-pages-game)"
 MIN_ANSWERS = 30
-MAX_FACET_ANSWERS = 450
-MAX_SEED_ANSWERS = 1800
+MAX_FACET_ANSWERS = 1200
+MAX_SEED_ANSWERS = 3500
+
+
+# Comprehensive curated island & island territory additions (ensuring Bonaire, Aruba,
+# Curacao, Caribbean islands, British/European/Pacific/Asian islands are never missed)
+CURATED_ISLANDS: list[tuple[str, float, list[str]]] = [
+    ("Bonaire", 45.0, ["Bonaire Island"]),
+    ("Aruba", 85.0, []),
+    ("Curacao", 78.0, ["Curaçao"]),
+    ("Sint Maarten", 55.0, ["Saint Martin"]),
+    ("Saba", 24.0, ["Saba Island"]),
+    ("Sint Eustatius", 22.0, ["Statia"]),
+    ("Saint Lucia", 82.0, ["St Lucia", "St. Lucia"]),
+    ("Saint Vincent", 58.0, ["St Vincent", "St. Vincent"]),
+    ("Grenada", 80.0, []),
+    ("Dominica", 76.0, []),
+    ("Antigua", 64.0, []),
+    ("Barbuda", 28.0, []),
+    ("Saint Kitts", 50.0, ["St Kitts", "St. Kitts"]),
+    ("Nevis", 26.0, []),
+    ("Barbados", 92.0, []),
+    ("Trinidad", 72.0, []),
+    ("Tobago", 48.0, []),
+    ("Anguilla", 46.0, []),
+    ("Montserrat", 44.0, []),
+    ("Guadeloupe", 68.0, []),
+    ("Martinique", 69.0, []),
+    ("Saint Barthelemy", 36.0, ["St Barts", "St. Barts", "Saint-Barthelemy"]),
+    ("Bermuda", 88.0, []),
+    ("Grand Cayman", 52.0, []),
+    ("Cayman Brac", 18.0, []),
+    ("Little Cayman", 14.0, []),
+    ("Turks and Caicos", 56.0, []),
+    ("Puerto Rico", 130.0, []),
+    ("Vieques", 24.0, []),
+    ("Culebra", 19.0, []),
+    ("Hispaniola", 74.0, []),
+    ("New Providence", 34.0, []),
+    ("Grand Bahama", 32.0, []),
+    ("Eleuthera", 21.0, []),
+    ("Exuma", 20.0, []),
+    ("Cozumel", 48.0, []),
+    ("Roatan", 30.0, []),
+    ("Margarita Island", 31.0, []),
+    ("Isle of Wight", 64.0, []),
+    ("Anglesey", 46.0, []),
+    ("Isle of Mull", 32.0, ["Mull"]),
+    ("Isle of Lewis", 31.0, ["Lewis"]),
+    ("Gozo", 42.0, []),
+    ("Elba", 52.0, []),
+    ("Capri", 62.0, []),
+    ("Ischia", 40.0, []),
+    ("Rhodes", 72.0, []),
+    ("Corfu", 68.0, []),
+    ("Mykonos", 64.0, []),
+    ("Naxos", 42.0, []),
+    ("Paros", 38.0, []),
+    ("Zakynthos", 41.0, []),
+    ("Lesbos", 50.0, []),
+    ("Menorca", 54.0, []),
+    ("Formentera", 34.0, []),
+    ("Tenerife", 76.0, []),
+    ("Gran Canaria", 68.0, []),
+    ("Lanzarote", 58.0, []),
+    ("Fuerteventura", 49.0, []),
+    ("La Palma", 46.0, []),
+    ("Madeira", 78.0, []),
+    ("Sao Miguel", 35.0, []),
+    ("Terceira", 26.0, []),
+    ("Pico", 22.0, []),
+    ("Bioko", 32.0, []),
+    ("Sao Tome", 44.0, []),
+    ("Principe", 24.0, []),
+    ("Pemba", 28.0, []),
+    ("Mafia Island", 16.0, []),
+    ("Nosy Be", 20.0, []),
+    ("Rodrigues", 26.0, []),
+    ("Mahe", 32.0, []),
+    ("Praslin", 22.0, []),
+    ("Bahrain", 96.0, []),
+    ("Phuket", 74.0, []),
+    ("Koh Samui", 48.0, []),
+    ("Koh Phi Phi", 36.0, []),
+    ("Penang", 66.0, []),
+    ("Langkawi", 44.0, []),
+    ("Singapore", 145.0, []),
+    ("Bintan", 22.0, []),
+    ("Batam", 28.0, []),
+    ("Sulawesi", 68.0, []),
+    ("Lombok", 52.0, []),
+    ("Sumbawa", 34.0, []),
+    ("Flores", 36.0, []),
+    ("Komodo", 46.0, []),
+    ("Timor", 58.0, []),
+    ("Halmahera", 26.0, []),
+    ("New Guinea", 86.0, []),
+    ("Cebu", 62.0, []),
+    ("Palawan", 54.0, []),
+    ("Boracay", 45.0, []),
+    ("Bohol", 42.0, []),
+    ("Taiwan", 140.0, []),
+    ("Hainan", 68.0, []),
+    ("Hong Kong Island", 70.0, []),
+    ("Jeju", 66.0, ["Jeju Island"]),
+    ("Ulleungdo", 22.0, []),
+    ("Shikoku", 72.0, []),
+    ("Kyushu", 78.0, []),
+    ("Okinawa", 84.0, []),
+    ("Yakushima", 34.0, []),
+    ("Sakhalin", 64.0, []),
+    ("Kangaroo Island", 38.0, []),
+    ("Fraser Island", 34.0, ["K'gari"]),
+    ("Lord Howe Island", 24.0, []),
+    ("Norfolk Island", 32.0, []),
+    ("Christmas Island", 36.0, []),
+    ("North Island", 72.0, []),
+    ("South Island", 72.0, []),
+    ("Stewart Island", 28.0, []),
+    ("Waiheke", 20.0, ["Waiheke Island"]),
+    ("Viti Levu", 36.0, []),
+    ("Vanua Levu", 24.0, []),
+    ("Upolu", 26.0, []),
+    ("Savaii", 22.0, []),
+    ("Tutuila", 20.0, []),
+    ("Tongatapu", 24.0, []),
+    ("Rarotonga", 30.0, []),
+    ("Aitutaki", 18.0, []),
+    ("Moorea", 32.0, []),
+    ("Nauru", 64.0, []),
+    ("Tuvalu", 60.0, []),
+    ("Tarawa", 26.0, []),
+    ("Majuro", 24.0, []),
+    ("Guam", 82.0, []),
+    ("Saipan", 46.0, []),
+    ("Tinian", 26.0, []),
+    ("Kauai", 56.0, []),
+    ("Molokai", 36.0, []),
+    ("Lanai", 30.0, []),
+    ("Vancouver Island", 74.0, []),
+    ("Newfoundland", 82.0, []),
+    ("Prince Edward Island", 72.0, []),
+    ("Cape Breton", 48.0, ["Cape Breton Island"]),
+    ("Long Island", 86.0, []),
+    ("Manhattan", 110.0, []),
+    ("Staten Island", 74.0, []),
+    ("Martha's Vineyard", 52.0, []),
+    ("Nantucket", 50.0, []),
+    ("Key West", 62.0, []),
+    ("Catalina Island", 42.0, []),
+    ("Alcatraz", 72.0, ["Alcatraz Island"]),
+    ("Kodiak Island", 40.0, []),
+    ("Galveston", 44.0, ["Galveston Island"]),
+    ("Tierra del Fuego", 66.0, []),
+    ("Chiloe", 38.0, ["Chiloe Island"]),
+    ("Robinson Crusoe Island", 22.0, []),
+    ("Isabela", 28.0, []),
+]
 
 
 def normalize_answer(raw: str) -> str:
@@ -110,7 +268,9 @@ def run_sparql_rows(name: str, query: str) -> list[dict[str, str]]:
     MASTER_CACHE.mkdir(parents=True, exist_ok=True)
     cache_file = MASTER_CACHE / f"{name}.json"
     if cache_file.exists():
-        return json.loads(cache_file.read_text("utf-8"))
+        data = json.loads(cache_file.read_text("utf-8"))
+        if len(data) > 0:
+            return data
 
     url = f"{SPARQL_ENDPOINT}?{urllib.parse.urlencode({'query': query})}"
     req = urllib.request.Request(
@@ -124,7 +284,7 @@ def run_sparql_rows(name: str, query: str) -> list[dict[str, str]]:
     for attempt in range(2):
         try:
             time.sleep(0.5 * (attempt + 1))
-            with urllib.request.urlopen(req, timeout=12) as resp:
+            with urllib.request.urlopen(req, timeout=14) as resp:
                 payload = json.loads(resp.read().decode("utf-8"))
             rows: list[dict[str, str]] = []
             for b in payload.get("results", {}).get("bindings", []):
@@ -133,14 +293,14 @@ def run_sparql_rows(name: str, query: str) -> list[dict[str, str]]:
                 if not lbl or re.match(r"^Q\d+$", lbl):
                     continue
                 rows.append(row)
-            cache_file.write_text(json.dumps(rows), encoding="utf-8")
+            if rows:
+                cache_file.write_text(json.dumps(rows), encoding="utf-8")
             print(f"  [SPARQL] {name}: {len(rows)} rows")
             return rows
         except Exception as exc:
             print(f"  [SPARQL retry {attempt+1}] {name}: {exc}")
-            time.sleep(1.5 * (attempt + 1))
+            time.sleep(1.2 * (attempt + 1))
 
-    cache_file.write_text("[]", encoding="utf-8")
     return []
 
 
@@ -148,8 +308,6 @@ def build_balanced_tiers(
     scored_items: list[tuple[str, float, list[str]]],
     max_answers: int = MAX_FACET_ANSWERS,
 ) -> dict[str, list[Any]] | None:
-    """Deduplicate items, rank descending by score, and split into all 6 non-empty tiers."""
-    # Sort descending by score
     ordered = sorted(scored_items, key=lambda x: x[1], reverse=True)
     seen_norms: set[str] = set()
     unique: list[tuple[str, float, list[str]]] = []
@@ -182,8 +340,6 @@ def build_balanced_tiers(
     if n < MIN_ANSWERS:
         return None
 
-    # Quantile boundaries guaranteeing every tier gets >= 2 items
-    # Distribution: 6% plankton, 10% tooclever, 16% schooler, 24% rare, 26% deepcut, 18% krillion
     cuts = [
         max(2, round(n * 0.06)),
         max(4, round(n * 0.16)),
@@ -192,7 +348,6 @@ def build_balanced_tiers(
         max(18, round(n * 0.82)),
         n,
     ]
-    # Ensure strictly increasing cuts within n
     prev = 0
     for idx in range(5):
         remaining_tiers = 5 - idx
@@ -220,6 +375,32 @@ def build_balanced_tiers(
     if any(len(tiers_map[t]) == 0 for t in TIERS):
         return None
     return tiers_map
+
+
+def merge_additional_into_tiers(
+    base_tiers: dict[str, list[Any]],
+    additions: list[tuple[str, float, list[str]]],
+    max_total: int = MAX_SEED_ANSWERS,
+) -> dict[str, list[Any]]:
+    """Preserve base seed/enriched items at their tiers, and append new verified items."""
+    tier_weight = {
+        "plankton": 140.0,
+        "tooclever": 80.0,
+        "schooler": 50.0,
+        "rare": 30.0,
+        "deepcut": 15.0,
+        "krillion": 5.0,
+    }
+    combined: list[tuple[str, float, list[str]]] = []
+    for t in TIERS:
+        for item in base_tiers[t]:
+            if isinstance(item, str):
+                combined.append((item, tier_weight[t], []))
+            else:
+                combined.append((item[0], tier_weight[t], item[1:]))
+    combined.extend(additions)
+    merged = build_balanced_tiers(combined, max_answers=max_total)
+    return merged if merged else base_tiers
 
 
 class PromptRegistry:
@@ -259,6 +440,14 @@ class PromptRegistry:
         self.seen_texts.add(tkey)
         return True
 
+    def upgrade(self, pid: str, additions: list[tuple[str, float, list[str]]], max_total: int = MAX_SEED_ANSWERS) -> None:
+        existing = self.by_id.get(pid)
+        if not existing or not additions:
+            return
+        new_tiers = merge_additional_into_tiers(existing["tiers"], additions, max_total)
+        existing["tiers"] = new_tiers
+        existing["answerCount"] = sum(len(v) for v in new_tiers.values())
+
 
 def load_seed_and_existing(reg: PromptRegistry) -> None:
     seeds: list[dict[str, Any]] = json.loads(SEED_PATH.read_text("utf-8"))
@@ -270,7 +459,6 @@ def load_seed_and_existing(reg: PromptRegistry) -> None:
         if src_path.exists():
             raw = json.loads(src_path.read_text("utf-8"))
             tiers_map = raw["tiers"]
-            # Trim only if massive while preserving all tiers
             total = sum(len(v) for v in tiers_map.values())
             if total > MAX_SEED_ANSWERS:
                 scale = MAX_SEED_ANSWERS / total
@@ -290,8 +478,34 @@ def load_seed_and_existing(reg: PromptRegistry) -> None:
         reg.add(pid, seed["text"], seed["category"], tiers_map)
 
 
+def deepen_islands_and_archipelagos(reg: PromptRegistry) -> None:
+    """Ensure Bonaire, Aruba, Curacao, island countries, atolls, volcanic islands, and Caribbean entities are all included."""
+    island_queries = [
+        ("island_countries", "Q112099", 1),
+        ("atolls", "Q42523", 2),
+        ("volcanic_islands", "Q1161182", 2),
+        ("caribbean_public", "Q3237519", 1),
+        ("island_groups", "Q1402592", 2),
+    ]
+    extra_islands: list[tuple[str, float, list[str]]] = list(CURATED_ISLANDS)
+    for name, qid, min_sl in island_queries:
+        q = f"""
+SELECT ?itemLabel ?sitelinks WHERE {{
+  ?item wdt:P31 wd:{qid} .
+  ?item wikibase:sitelinks ?sitelinks .
+  FILTER(?sitelinks >= {min_sl})
+  SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en". }}
+}} ORDER BY DESC(?sitelinks) LIMIT 1200"""
+        for r in run_sparql_rows(name, q):
+            c = clean_label(r["itemLabel"])
+            if c:
+                extra_islands.append((c[0], float(r.get("sitelinks", 1) or 1), c[1]))
+
+    reg.upgrade("geo-island", extra_islands, MAX_SEED_ANSWERS)
+    reg.upgrade("geo-archipelago", extra_islands, MAX_SEED_ANSWERS)
+
+
 def slice_existing_prompts(reg: PromptRegistry) -> int:
-    """Slice large existing enriched prompts by starting letter."""
     added = 0
     slice_configs = [
         ("gen-magazine", "Name a magazine starting with the letter {L}", "general"),
@@ -330,6 +544,8 @@ def slice_existing_prompts(reg: PromptRegistry) -> int:
         ("geo-waterfall", "Name a waterfall starting with the letter {L}", "geography"),
         ("geo-desert", "Name a desert starting with the letter {L}", "geography"),
         ("geo-landmark", "Name a world landmark starting with the letter {L}", "geography"),
+        ("geo-archipelago", "Name an island nation or archipelago starting with the letter {L}", "geography"),
+        ("gen-tv-us", "Name an American TV show starting with the letter {L}", "general"),
     ]
 
     tier_weight = {
@@ -429,13 +645,11 @@ def enrich_from_master_wikidata(reg: PromptRegistry) -> int:
             ):
                 added += 1
 
-    # 1. Cities by continent & country
+    # 1. Cities by continent, country, and Americas/major countries
     continents = [
         ("eu", "Q46", "European", 10),
         ("as", "Q48", "Asian", 10),
         ("af", "Q15", "African", 6),
-        ("na", "Q49", "North American", 18),
-        ("sa", "Q18", "South American", 10),
         ("oc", "Q55643", "Oceanian", 3),
     ]
     all_cities: list[dict[str, str]] = []
@@ -454,7 +668,33 @@ SELECT ?itemLabel ?countryLabel ?sitelinks WHERE {{
         add_group_slices(rows, "countryLabel", f"geo-city-{code}", "Name a city in {G}", "geography")
         add_letter_slices(rows, f"geo-city-{code}", f"Name a {cname} city starting with the letter {{L}}", "geography")
 
-    # Also U.S. cities by state
+    # Fast per-country Americas cities (fixes cities_na / cities_sa timeouts!)
+    americas_countries = [
+        ("usa", "Q30", "the United States", 10),
+        ("canada", "Q16", "Canada", 4),
+        ("mexico", "Q96", "Mexico", 6),
+        ("brazil", "Q155", "Brazil", 6),
+        ("argentina", "Q414", "Argentina", 5),
+        ("colombia", "Q739", "Colombia", 4),
+        ("peru", "Q419", "Peru", 4),
+        ("chile", "Q298", "Chile", 4),
+    ]
+    for code, qid, cname, min_sl in americas_countries:
+        q = f"""
+SELECT ?itemLabel ?sitelinks WHERE {{
+  ?item wdt:P31 wd:Q515 .
+  ?item wdt:P17 wd:{qid} .
+  ?item wikibase:sitelinks ?sitelinks .
+  FILTER(?sitelinks >= {min_sl})
+  SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en". }}
+}} ORDER BY DESC(?sitelinks) LIMIT 1600"""
+        rows = run_sparql_rows(f"cities_am_{code}", q)
+        all_cities.extend(rows)
+        items = [(c[0], float(r.get("sitelinks", 1) or 1), c[1]) for r in rows if (c := clean_label(r["itemLabel"]))]
+        reg.add(f"geo-city-am-{code}", f"Name a city in {cname}", "geography", build_balanced_tiers(items))
+        add_letter_slices(rows, f"geo-city-am-{code}", f"Name a city in {cname} starting with the letter {{L}}", "geography")
+
+    # U.S. cities by state
     us_states_q = """
 SELECT ?itemLabel ?stateLabel ?sitelinks WHERE {
   ?item wdt:P31 wd:Q1093829 .
@@ -468,10 +708,35 @@ SELECT ?itemLabel ?stateLabel ?sitelinks WHERE {
     add_group_slices(us_cities, "stateLabel", "geo-us-city", "Name a city in {G}", "geography")
     add_letter_slices(all_cities, "geo-world-city", "Name a world city starting with the letter {L}", "geography")
 
-    # 2. Films by decade, year, genre, country, letter (using indexed xsd:dateTime range!)
+    # Fast per-country rivers (fixes rivers_country timeout!)
+    river_countries = [
+        ("usa", "Q30", "the United States", 8),
+        ("russia", "Q159", "Russia", 8),
+        ("canada", "Q16", "Canada", 6),
+        ("brazil", "Q155", "Brazil", 6),
+        ("china", "Q148", "China", 6),
+        ("france", "Q142", "France", 6),
+        ("germany", "Q183", "Germany", 6),
+        ("uk", "Q145", "the United Kingdom", 6),
+        ("australia", "Q408", "Australia", 5),
+        ("india", "Q668", "India", 6),
+    ]
+    for code, qid, cname, min_sl in river_countries:
+        q = f"""
+SELECT ?itemLabel ?sitelinks WHERE {{
+  ?item wdt:P31 wd:Q4022 .
+  ?item wdt:P17 wd:{qid} .
+  ?item wikibase:sitelinks ?sitelinks .
+  FILTER(?sitelinks >= {min_sl})
+  SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en". }}
+}} ORDER BY DESC(?sitelinks) LIMIT 800"""
+        rows = run_sparql_rows(f"rivers_{code}", q)
+        items = [(c[0], float(r.get("sitelinks", 1) or 1), c[1]) for r in rows if (c := clean_label(r["itemLabel"]))]
+        reg.add(f"geo-riv-{code}", f"Name a river in {cname}", "geography", build_balanced_tiers(items))
+
+    # 2. Films by decade, year, genre, genre x decade, country, letter
     film_decades = [
         ("1940s", 1940, 1949, 10),
-        ("1950s", 1950, 1959, 12),
         ("1960s", 1960, 1969, 14),
         ("1970s", 1970, 1979, 14),
         ("1980s", 1980, 1989, 16),
@@ -481,6 +746,8 @@ SELECT ?itemLabel ?stateLabel ?sitelinks WHERE {
         ("2020s", 2020, 2025, 16),
     ]
     all_films: list[dict[str, str]] = []
+    decade_film_norms: dict[str, dict[str, tuple[str, float, list[str]]]] = {}
+
     for dlabel, y0, y1, min_sl in film_decades:
         q = f"""
 SELECT ?itemLabel (YEAR(?pub) AS ?year) ?sitelinks WHERE {{
@@ -493,12 +760,15 @@ SELECT ?itemLabel (YEAR(?pub) AS ?year) ?sitelinks WHERE {{
 }} ORDER BY DESC(?sitelinks) LIMIT 2800"""
         rows = run_sparql_rows(f"films_{dlabel}", q)
         all_films.extend(rows)
-        # Decade prompt
         dec_items = []
+        dmap: dict[str, tuple[str, float, list[str]]] = {}
         for r in rows:
             c = clean_label(r["itemLabel"])
             if c:
-                dec_items.append((c[0], float(r.get("sitelinks", 1) or 1), c[1]))
+                sl = float(r.get("sitelinks", 1) or 1)
+                dec_items.append((c[0], sl, c[1]))
+                dmap[normalize_answer(c[0])] = (c[0], sl, c[1])
+        decade_film_norms[dlabel] = dmap
         reg.add(f"mov-decade-{dlabel}", f"Name a movie from the {dlabel}", "movies", build_balanced_tiers(dec_items))
         add_group_slices(rows, "year", "mov-year", "Name a movie released in {G}", "movies", min_group=35)
         add_letter_slices(rows, f"mov-{dlabel}", f"Name a {dlabel} movie starting with the letter {{L}}", "movies")
@@ -508,13 +778,17 @@ SELECT ?itemLabel (YEAR(?pub) AS ?year) ?sitelinks WHERE {{
         r for r in all_films
         if (c := clean_label(r["itemLabel"])) and " " not in c[0] and "-" not in c[0]
     ]
+    one_word_items = [
+        (c[0], float(r.get("sitelinks", 1) or 1), c[1])
+        for r in one_word_films
+        if (c := clean_label(r["itemLabel"]))
+    ]
+    reg.upgrade("mov-one-word", one_word_items, MAX_SEED_ANSWERS)
     add_letter_slices(one_word_films, "mov-oneword", "Name a one-word movie starting with the letter {L}", "movies")
 
-    # Film genres
     film_genres = [
         ("action", "Q188473", "Action"),
         ("adventure", "Q319221", "Adventure"),
-        ("animated", "Q202866", "Animated"),
         ("comedy", "Q157443", "Comedy"),
         ("crime", "Q959790", "Crime"),
         ("documentary", "Q93204", "Documentary"),
@@ -529,6 +803,7 @@ SELECT ?itemLabel (YEAR(?pub) AS ?year) ?sitelinks WHERE {{
         ("superhero", "Q1535153", "Superhero"),
         ("family", "Q1361932", "Family"),
     ]
+    genre_film_norms: dict[str, tuple[str, dict[str, tuple[str, float, list[str]]]]] = {}
     for gid, qid, gname in film_genres:
         q = f"""
 SELECT ?itemLabel ?sitelinks WHERE {{
@@ -540,12 +815,38 @@ SELECT ?itemLabel ?sitelinks WHERE {{
 }} ORDER BY DESC(?sitelinks) LIMIT 2200"""
         rows = run_sparql_rows(f"film_genre_{gid}", q)
         items = []
+        gmap: dict[str, tuple[str, float, list[str]]] = {}
         for r in rows:
             c = clean_label(r["itemLabel"])
             if c:
-                items.append((c[0], float(r.get("sitelinks", 1) or 1), c[1]))
+                sl = float(r.get("sitelinks", 1) or 1)
+                items.append((c[0], sl, c[1]))
+                gmap[normalize_answer(c[0])] = (c[0], sl, c[1])
+        genre_film_norms[gid] = (gname, gmap)
         reg.add(f"mov-genre-{gid}", f"Name a {gname} movie", "movies", build_balanced_tiers(items))
         add_letter_slices(rows, f"mov-genre-{gid}", f"Name a {gname} movie starting with the letter {{L}}", "movies")
+
+    # Deepen mov-90s-comedy and generate Genre x Decade intersections (zero network!)
+    if "1990s" in decade_film_norms and "comedy" in genre_film_norms:
+        d90 = decade_film_norms["1990s"]
+        gcom = genre_film_norms["comedy"][1]
+        inter90 = [d90[k] for k in d90 if k in gcom]
+        reg.upgrade("mov-90s-comedy", inter90, MAX_SEED_ANSWERS)
+
+    for dlabel in ["1970s", "1980s", "1990s", "2000s", "2010s", "2020s"]:
+        dmap = decade_film_norms.get(dlabel, {})
+        for gid, (gname, gmap) in genre_film_norms.items():
+            if dlabel == "1990s" and gid == "comedy":
+                continue
+            inter = [dmap[k] for k in dmap if k in gmap]
+            if len(inter) >= MIN_ANSWERS:
+                if reg.add(
+                    f"mov-gd-{dlabel}-{gid}",
+                    f"Name a {dlabel} {gname} movie",
+                    "movies",
+                    build_balanced_tiers(inter),
+                ):
+                    added += 1
 
     # Films by country
     film_countries = [
@@ -579,19 +880,78 @@ SELECT ?itemLabel ?sitelinks WHERE {{
         reg.add(f"mov-country-{cid}", f"Name a {adj} movie", "movies", build_balanced_tiers(items))
         add_letter_slices(rows, f"mov-country-{cid}", f"Name a {adj} movie starting with the letter {{L}}", "movies")
 
-    # 3. TV Series & Video Games (lean non-OPTIONAL queries for fast execution)
+    # 3. TV Series (fixed Q5398426!), Anime, Manga, Songs, Video Game genres, Fictional Characters
     tv_q = """
 SELECT ?itemLabel ?sitelinks WHERE {
-  ?item wdt:P31 wd:Q5398419 .
+  ?item wdt:P31 wd:Q5398426 .
   ?item wikibase:sitelinks ?sitelinks .
-  FILTER(?sitelinks >= 16)
+  FILTER(?sitelinks >= 14)
   SERVICE wikibase:label { bd:serviceParam wikibase:language "en". }
 } ORDER BY DESC(?sitelinks) LIMIT 2800"""
-    tv_rows = run_sparql_rows("tv_series", tv_q)
+    tv_rows = run_sparql_rows("tv_series_v2", tv_q)
     tv_items = [(c[0], float(r.get("sitelinks", 1) or 1), c[1]) for r in tv_rows if (c := clean_label(r["itemLabel"]))]
     reg.add("gen-tv-show", "Name a TV show or series", "general", build_balanced_tiers(tv_items, MAX_SEED_ANSWERS))
     add_letter_slices(tv_rows, "gen-tv", "Name a TV show starting with the letter {L}", "general")
 
+    # TV series by country
+    for code, qid, adj in [
+        ("us", "Q30", "American"),
+        ("uk", "Q145", "British"),
+        ("jp", "Q17", "Japanese"),
+        ("kr", "Q884", "South Korean"),
+        ("ca", "Q16", "Canadian"),
+    ]:
+        q = f"""
+SELECT ?itemLabel ?sitelinks WHERE {{
+  ?item wdt:P31 wd:Q5398426 .
+  ?item wdt:P495 wd:{qid} .
+  ?item wikibase:sitelinks ?sitelinks .
+  FILTER(?sitelinks >= 12)
+  SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en". }}
+}} ORDER BY DESC(?sitelinks) LIMIT 1600"""
+        rows = run_sparql_rows(f"tv_{code}", q)
+        items = [(c[0], float(r.get("sitelinks", 1) or 1), c[1]) for r in rows if (c := clean_label(r["itemLabel"]))]
+        reg.add(f"gen-tv-{code}", f"Name a {adj} TV show", "general", build_balanced_tiers(items))
+
+    # Anime & Manga
+    anime_q = """
+SELECT ?itemLabel ?sitelinks WHERE {
+  ?item wdt:P31 wd:Q63952888 .
+  ?item wikibase:sitelinks ?sitelinks .
+  FILTER(?sitelinks >= 8)
+  SERVICE wikibase:label { bd:serviceParam wikibase:language "en". }
+} ORDER BY DESC(?sitelinks) LIMIT 1800"""
+    anime_rows = run_sparql_rows("anime_series", anime_q)
+    anime_items = [(c[0], float(r.get("sitelinks", 1) or 1), c[1]) for r in anime_rows if (c := clean_label(r["itemLabel"]))]
+    reg.add("gen-anime", "Name an anime series", "general", build_balanced_tiers(anime_items, MAX_SEED_ANSWERS))
+    add_letter_slices(anime_rows, "gen-anime", "Name an anime series starting with the letter {L}", "general")
+
+    manga_q = """
+SELECT ?itemLabel ?sitelinks WHERE {
+  ?item wdt:P31 wd:Q21198342 .
+  ?item wikibase:sitelinks ?sitelinks .
+  FILTER(?sitelinks >= 8)
+  SERVICE wikibase:label { bd:serviceParam wikibase:language "en". }
+} ORDER BY DESC(?sitelinks) LIMIT 1800"""
+    manga_rows = run_sparql_rows("manga_series", manga_q)
+    manga_items = [(c[0], float(r.get("sitelinks", 1) or 1), c[1]) for r in manga_rows if (c := clean_label(r["itemLabel"]))]
+    reg.add("gen-manga", "Name a manga series", "general", build_balanced_tiers(manga_items, MAX_SEED_ANSWERS))
+    add_letter_slices(manga_rows, "gen-manga", "Name a manga series starting with the letter {L}", "general")
+
+    # Hit Singles / Songs
+    songs_q = """
+SELECT ?itemLabel ?sitelinks WHERE {
+  ?item wdt:P31 wd:Q134556 .
+  ?item wikibase:sitelinks ?sitelinks .
+  FILTER(?sitelinks >= 18)
+  SERVICE wikibase:label { bd:serviceParam wikibase:language "en". }
+} ORDER BY DESC(?sitelinks) LIMIT 2600"""
+    song_rows = run_sparql_rows("hit_songs", songs_q)
+    song_items = [(c[0], float(r.get("sitelinks", 1) or 1), c[1]) for r in song_rows if (c := clean_label(r["itemLabel"]))]
+    reg.add("gen-song", "Name a famous song or single", "general", build_balanced_tiers(song_items, MAX_SEED_ANSWERS))
+    add_letter_slices(song_rows, "gen-song", "Name a famous song starting with the letter {L}", "general")
+
+    # Video games + subgenres
     vg_q = """
 SELECT ?itemLabel ?sitelinks WHERE {
   ?item wdt:P31 wd:Q7889 .
@@ -604,10 +964,32 @@ SELECT ?itemLabel ?sitelinks WHERE {
     reg.add("gen-video-game", "Name a video game", "general", build_balanced_tiers(vg_items, MAX_SEED_ANSWERS))
     add_letter_slices(vg_rows, "gen-vg", "Name a video game starting with the letter {L}", "general")
 
-    # 4. Books/Novels, Authors, Bands, Singers, Albums, Actors, Painters
+    vg_genres = [
+        ("rpg", "Q744038", "role-playing (RPG)"),
+        ("fps", "Q185029", "first-person shooter"),
+        ("platformer", "Q828322", "platformer"),
+        ("strategy", "Q472285", "strategy"),
+        ("racing", "Q860750", "racing"),
+        ("fighting", "Q744038", "fighting"),
+        ("horror", "Q223251", "survival horror"),
+    ]
+    vg_genres[5] = ("fighting", "Q343568", "fighting")
+    for gid, qid, gname in vg_genres:
+        q = f"""
+SELECT ?itemLabel ?sitelinks WHERE {{
+  ?item wdt:P31 wd:Q7889 .
+  ?item wdt:P136 wd:{qid} .
+  ?item wikibase:sitelinks ?sitelinks .
+  FILTER(?sitelinks >= 10)
+  SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en". }}
+}} ORDER BY DESC(?sitelinks) LIMIT 1200"""
+        rows = run_sparql_rows(f"vg_genre_{gid}", q)
+        items = [(c[0], float(r.get("sitelinks", 1) or 1), c[1]) for r in rows if (c := clean_label(r["itemLabel"]))]
+        reg.add(f"gen-vg-{gid}", f"Name a {gname} video game", "general", build_balanced_tiers(items))
+
+    # 4. Master lists: Literature, Arts, Music, History, Science, Nature, Tech, Sports
     master_lists = [
         ("books", "Q7725634", "P31", 15, "gen-book", "Name a famous book or novel", "general"),
-        ("authors", "Q36180", "P106", 28, "gen-author", "Name an author or writer", "general"),
         ("actors", "Q33999", "P106", 35, "mov-actor", "Name a film or TV actor", "movies"),
         ("painters", "Q1028181", "P106", 20, "gen-painter", "Name a famous painter or artist", "general"),
         ("bands", "Q215380", "P31", 22, "gen-band", "Name a musical band or group", "general"),
@@ -621,19 +1003,46 @@ SELECT ?itemLabel ?sitelinks WHERE {
         ("airports", "Q1248784", "P31", 18, "geo-airport", "Name an international airport", "geography"),
         ("battles", "Q178561", "P31", 18, "gen-battle", "Name a historical battle", "general"),
         ("wars", "Q198", "P31", 18, "gen-war", "Name a historical war or conflict", "general"),
-        ("mammals", "Q7377", "P171", 4, "gen-mammal", "Name a mammal species or genus", "general"),
-        ("birds", "Q5113", "P171", 4, "gen-bird", "Name a bird species", "general"),
-        ("fishes", "Q152", "P171", 3, "gen-fish", "Name a fish species", "general"),
-        ("snakes", "Q2102", "P171", 2, "gen-snake", "Name a snake species", "general"),
         ("dishes", "Q746549", "P31", 6, "gen-dish", "Name a traditional dish or food", "general"),
         ("football_clubs", "Q476028", "P31", 20, "spt-football-club", "Name a football (soccer) club", "sports"),
-        ("footballers", "Q937857", "P106", 35, "spt-footballer", "Name a professional footballer (soccer player)", "sports"),
         ("nba_players", "Q3665646", "P106", 20, "spt-nba-player", "Name a basketball player", "sports"),
         ("baseball_players", "Q10871364", "P106", 22, "spt-mlb-player", "Name a baseball player", "sports"),
         ("f1_drivers", "Q10841764", "P106", 12, "spt-f1-driver", "Name a Formula 1 driver", "sports"),
         ("boxers", "Q11338576", "P106", 15, "spt-boxer", "Name a boxer", "sports"),
-        ("golfers", "Q13156709", "P106", 14, "spt-golfer", "Name a professional golfer", "sports"),
         ("chess_players", "Q10873124", "P106", 12, "spt-chess-player", "Name a chess grandmaster or player", "sports"),
+        # New rich non-pop-culture categories:
+        ("golfers_v2", "Q490253", "P106", 10, "spt-golfer", "Name a professional golfer", "sports"),
+        ("nfl_players", "Q19204627", "P106", 16, "spt-nfl-player", "Name an American football (NFL) player", "sports"),
+        ("nhl_players", "Q11774891", "P106", 16, "spt-nhl-player", "Name an ice hockey (NHL) player", "sports"),
+        ("swimmers", "Q10843402", "P106", 12, "spt-swimmer", "Name a competitive swimmer", "sports"),
+        ("cyclists", "Q2309784", "P106", 15, "spt-cyclist", "Name a professional cyclist", "sports"),
+        ("cricketers", "Q12299841", "P106", 12, "spt-cricketer", "Name a cricketer", "sports"),
+        ("philosophers", "Q4964182", "P106", 20, "gen-philosopher", "Name a philosopher", "general"),
+        ("architects", "Q42973", "P106", 16, "gen-architect", "Name a famous architect", "general"),
+        ("inventors", "Q205375", "P106", 15, "gen-inventor", "Name an inventor", "general"),
+        ("explorers", "Q11900058", "P106", 12, "gen-explorer", "Name a famous explorer", "general"),
+        ("monarchs", "Q116", "P39", 22, "gen-monarch", "Name a monarch, king, or queen", "general"),
+        ("companies", "Q4830453", "P31", 28, "gen-company", "Name a well-known company or corporation", "general"),
+        ("websites", "Q35127", "P31", 16, "gen-website", "Name a website or online platform", "general"),
+        ("spacecraft", "Q40218", "P31", 12, "gen-spacecraft", "Name a spacecraft or space probe", "general"),
+        ("stars", "Q523", "P31", 12, "gen-star", "Name a star in the night sky", "general"),
+        ("compounds", "Q11173", "P31", 28, "gen-compound", "Name a chemical compound or molecule", "general"),
+        ("diseases", "Q12136", "P31", 20, "gen-disease", "Name a medical disease or condition", "general"),
+        ("cat_breeds", "Q43577", "P31", 2, "gen-cat-breed", "Name a cat breed", "general"),
+        ("horse_breeds", "Q23002039", "P31", 2, "gen-horse-breed", "Name a horse breed", "general"),
+        ("breads", "Q7802", "P31", 2, "gen-bread", "Name a type of bread", "general"),
+        ("soups", "Q41415", "P31", 2, "gen-soup", "Name a soup or stew", "general"),
+        ("sauces", "Q178359", "P31", 2, "gen-sauce", "Name a sauce or condiment", "general"),
+        ("pastries", "Q477248", "P31", 2, "gen-pastry", "Name a pastry or baked sweet", "general"),
+        ("wine_grapes", "Q10978", "P31", 3, "gen-grape", "Name a wine grape variety", "general"),
+        ("comics_chars", "Q1114461", "P31", 8, "gen-comic-char", "Name a comic book character", "general"),
+        ("skyscrapers", "Q11303", "P31", 8, "geo-skyscraper", "Name a skyscraper or tall tower", "geography"),
+        ("glaciers", "Q35666", "P31", 4, "geo-glacier", "Name a glacier", "geography"),
+        ("caves", "Q35509", "P31", 5, "geo-cave", "Name a cave or cavern", "geography"),
+        ("canyons", "Q150784", "P31", 3, "geo-canyon", "Name a canyon or gorge", "geography"),
+        ("bays", "Q39594", "P31", 6, "geo-bay", "Name a bay or gulf", "geography"),
+        ("capes", "Q185113", "P31", 5, "geo-cape", "Name a cape or headland", "geography"),
+        ("nobel_laureates", "Q7191", "P166", 20, "gen-nobel", "Name a Nobel Prize laureate", "general"),
     ]
 
     for key, qid, prop, min_sl, pid, ptext, cat in master_lists:
@@ -649,13 +1058,48 @@ SELECT ?itemLabel ?sitelinks WHERE {{
         reg.add(pid, ptext, cat, build_balanced_tiers(items, MAX_SEED_ANSWERS))
         add_letter_slices(rows, pid, f"{ptext} starting with the letter {{L}}", cat)
 
-    # People by country for Authors, Scientists, Footballers, Painters, Bands
+    # Footballers fast query (sitelinks >= 48)
+    fb_q = """
+SELECT ?itemLabel ?sitelinks WHERE {
+  ?item wdt:P106 wd:Q937857 .
+  ?item wikibase:sitelinks ?sitelinks .
+  FILTER(?sitelinks >= 48)
+  SERVICE wikibase:label { bd:serviceParam wikibase:language "en". }
+} ORDER BY DESC(?sitelinks) LIMIT 2400"""
+    fb_rows = run_sparql_rows("footballers_v2", fb_q)
+    fb_items = [(c[0], float(r.get("sitelinks", 1) or 1), c[1]) for r in fb_rows if (c := clean_label(r["itemLabel"]))]
+    reg.add("spt-footballer", "Name a professional footballer (soccer player)", "sports", build_balanced_tiers(fb_items, MAX_SEED_ANSWERS))
+    add_letter_slices(fb_rows, "spt-footballer", "Name a footballer starting with the letter {L}", "sports")
+
+    # Vertebrate & animal common names via P1843 (higher sitelink floor so SPARQL stays fast)
+    animal_classes = [
+        ("mammals_en", "Q7377", "gen-mammal", "Name a mammal species", "general"),
+        ("birds_en", "Q5113", "gen-bird", "Name a bird species", "general"),
+        ("reptiles_en", "Q10811", "gen-reptile", "Name a reptile species", "general"),
+        ("fishes_en", "Q152", "gen-fish", "Name a fish species", "general"),
+    ]
+    for key, qid, pid, ptext, cat in animal_classes:
+        q = f"""
+SELECT ?itemLabel ?sitelinks WHERE {{
+  ?item wdt:P1843 ?common .
+  FILTER(LANG(?common) = "en")
+  ?item wdt:P105 wd:Q7432 .
+  ?item wdt:P171* wd:{qid} .
+  ?item wikibase:sitelinks ?sitelinks .
+  FILTER(?sitelinks >= 30)
+  SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en". }}
+}} ORDER BY DESC(?sitelinks) LIMIT 900"""
+        rows = run_sparql_rows(key, q)
+        items = [(c[0], float(r.get("sitelinks", 1) or 1), c[1]) for r in rows if (c := clean_label(r["itemLabel"]))]
+        reg.add(pid, ptext, cat, build_balanced_tiers(items, MAX_SEED_ANSWERS))
+        add_letter_slices(rows, pid, f"{ptext} starting with the letter {{L}}", cat)
+
+    # People & places by country
     people_country_queries = [
         ("authors_country", "Q36180", "P106", "P27", 22, "gen-author-nat", "Name an author from {G}", "general"),
         ("bands_country", "Q215380", "P31", "P495", 16, "gen-band-nat", "Name a band from {G}", "general"),
         ("clubs_country", "Q476028", "P31", "P17", 15, "spt-club-nat", "Name a football club in {G}", "sports"),
         ("stadiums_country", "Q483110", "P31", "P17", 8, "spt-stad-nat", "Name a sports stadium in {G}", "sports"),
-        ("rivers_country", "Q4022", "P31", "P17", 8, "geo-riv-nat", "Name a river in {G}", "geography"),
         ("islands_country", "Q23442", "P31", "P17", 8, "geo-isl-nat", "Name an island in {G}", "geography"),
         ("lakes_country", "Q23397", "P31", "P17", 8, "geo-lak-nat", "Name a lake in {G}", "geography"),
         ("parks_country", "Q46169", "P31", "P17", 4, "geo-prk-nat", "Name a national park in {G}", "geography"),
@@ -663,6 +1107,7 @@ SELECT ?itemLabel ?sitelinks WHERE {{
         ("dishes_country", "Q746549", "P31", "P495", 3, "gen-dish-nat", "Name a traditional food or dish from {G}", "general"),
         ("universities_country", "Q3918", "P31", "P17", 18, "gen-uni-nat", "Name a university in {G}", "general"),
         ("museums_country", "Q33506", "P31", "P17", 10, "gen-mus-nat", "Name a museum in {G}", "general"),
+        ("castles_country", "Q23413", "P31", "P17", 6, "gen-cas-nat", "Name a castle or palace in {G}", "general"),
     ]
     for key, qid, prop, grp_prop, min_sl, id_pref, fmt, cat in people_country_queries:
         q = f"""
@@ -738,7 +1183,6 @@ def generate_wordcraft_prompts(reg: PromptRegistry, dict_scored: list[tuple[str,
         if reg.add(pid, text, "words", build_balanced_tiers(items, MAX_FACET_ANSWERS)):
             added += 1
 
-    # 1. Exact length (4..10) + starting letter (A..Z), and length (4..9) + ending letter
     by_len_start: dict[tuple[int, str], list[tuple[str, float]]] = defaultdict(list)
     by_len_end: dict[tuple[int, str], list[tuple[str, float]]] = defaultdict(list)
     by_start_end: dict[tuple[str, str], list[tuple[str, float]]] = defaultdict(list)
@@ -752,9 +1196,9 @@ def generate_wordcraft_prompts(reg: PromptRegistry, dict_scored: list[tuple[str,
     for w, sc in dict_scored:
         L = len(w)
         s0, s_end = w[0], w[-1]
-        if 4 <= L <= 10:
+        if 3 <= L <= 12:
             by_len_start[(L, s0)].append((w, sc))
-        if 4 <= L <= 9:
+        if 4 <= L <= 10:
             by_len_end[(L, s_end)].append((w, sc))
         if L >= 4:
             by_start_end[(s0, s_end)].append((w, sc))
@@ -773,65 +1217,32 @@ def generate_wordcraft_prompts(reg: PromptRegistry, dict_scored: list[tuple[str,
                     by_len_rare_ltr[(L, rl)].append((w, sc))
 
     for (L, ltr), items in sorted(by_len_start.items()):
-        emit(
-            f"wrd-len{L}-{ltr}",
-            f"Name a {L}-letter English word starting with {ltr.upper()}",
-            items,
-        )
+        emit(f"wrd-len{L}-{ltr}", f"Name a {L}-letter English word starting with {ltr.upper()}", items)
 
     for (L, ltr), items in sorted(by_len_end.items()):
-        if len(items) >= 60:
-            emit(
-                f"wrd-len{L}-end-{ltr}",
-                f"Name a {L}-letter English word ending in {ltr.upper()}",
-                items,
-            )
+        if len(items) >= 40:
+            emit(f"wrd-len{L}-end-{ltr}", f"Name a {L}-letter English word ending in {ltr.upper()}", items)
 
     for (s0, s_end), items in sorted(by_start_end.items()):
-        if len(items) >= 45:
-            emit(
-                f"wrd-se-{s0}-{s_end}",
-                f"Name an English word starting with {s0.upper()} and ending in {s_end.upper()}",
-                items,
-            )
+        if len(items) >= 34:
+            emit(f"wrd-se-{s0}-{s_end}", f"Name an English word starting with {s0.upper()} and ending in {s_end.upper()}", items)
 
     for ch, items in sorted(by_double_char.items()):
-        emit(
-            f"wrd-dbl-{ch}",
-            f"Name an English word containing a double '{ch.upper()}'",
-            items,
-        )
+        emit(f"wrd-dbl-{ch}", f"Name an English word containing a double '{ch.upper()}'", items)
 
     for L, items in sorted(by_len_double.items()):
-        emit(
-            f"wrd-dbl-len{L}",
-            f"Name a {L}-letter word containing a double letter",
-            items,
-        )
+        emit(f"wrd-dbl-len{L}", f"Name a {L}-letter word containing a double letter", items)
 
     for ltr, items in sorted(by_start_double.items()):
-        emit(
-            f"wrd-dbl-start-{ltr}",
-            f"Name a word starting with {ltr.upper()} that contains a double letter",
-            items,
-        )
+        emit(f"wrd-dbl-start-{ltr}", f"Name a word starting with {ltr.upper()} that contains a double letter", items)
 
     for (L, rl), items in sorted(by_len_rare_ltr.items()):
-        if len(items) >= 42:
-            emit(
-                f"wrd-has-{rl}-len{L}",
-                f"Name a {L}-letter word containing the letter {rl.upper()}",
-                items,
-            )
+        if len(items) >= 34:
+            emit(f"wrd-has-{rl}-len{L}", f"Name a {L}-letter word containing the letter {rl.upper()}", items)
 
     for ch, items in sorted(by_same_start_end.items()):
-        emit(
-            f"wrd-same-se-{ch}",
-            f"Name a word that starts and ends with the letter {ch.upper()}",
-            items,
-        )
+        emit(f"wrd-same-se-{ch}", f"Name a word that starts and ends with the letter {ch.upper()}", items)
 
-    # 2. Suffixes & Prefixes
     suffixes = [
         "tion", "sion", "ment", "ness", "able", "ible", "less", "ful", "ship",
         "hood", "ism", "ist", "ity", "ous", "ive", "ary", "ory", "ize", "ify",
@@ -841,7 +1252,9 @@ def generate_wordcraft_prompts(reg: PromptRegistry, dict_scored: list[tuple[str,
         "proof", "bound", "work", "land", "line", "side", "time", "way", "wood",
         "fish", "bird", "stone", "water", "light", "house", "head", "hand",
         "book", "back", "ball", "craft", "field", "form", "mark", "master",
-        "ware", "wright",
+        "ware", "wright", "ly", "er", "or", "al", "ic", "en", "ed", "ing",
+        "ian", "ate", "ant", "ent", "logy", "nomy", "pathy", "phobia",
+        "metry", "genic", "vore", "cide", "grade", "fold", "some", "most",
     ]
     for suf in suffixes:
         items = [(w, sc) for w, sc in dict_scored if w.endswith(suf) and len(w) > len(suf) + 1]
@@ -862,7 +1275,6 @@ def generate_wordcraft_prompts(reg: PromptRegistry, dict_scored: list[tuple[str,
         items = [(w, sc) for w, sc in dict_scored if w.startswith(pre) and len(w) > len(pre) + 2]
         emit(f"wrd-pre-{pre}", f'Name an English word starting with "{pre}-"', items)
 
-    # 3. Fun substring & letter-constraint patterns
     substrings = [
         "qu", "ph", "ch", "sh", "th", "gh", "kn", "wr", "ck", "ng",
         "oo", "ea", "ou", "ai", "ie", "ei", "cat", "dog", "sun", "sea",
@@ -878,78 +1290,69 @@ def generate_wordcraft_prompts(reg: PromptRegistry, dict_scored: list[tuple[str,
         items = [(w, sc) for w, sc in dict_scored if sub in w and len(w) >= max(4, len(sub) + 1)]
         emit(f"wrd-sub-{sub}", f'Name an English word containing "{sub.upper()}"', items)
 
-    # 4. Special linguistic & keyboard constraints
     vowels = set("aeiou")
     left_hand = set("qwertasdfgzxcvb")
     right_hand = set("yuiophjklnm")
     top_row = set("qwertyuiop")
 
-    emit(
-        "wrd-3-consec-vowels",
-        "Name an English word with 3 consecutive vowels (e.g. beauty)",
-        [(w, sc) for w, sc in dict_scored if re.search(r"[aeiou]{3}", w)],
-    )
-    emit(
-        "wrd-4-consec-cons",
-        "Name an English word with 4 consecutive consonants",
-        [(w, sc) for w, sc in dict_scored if re.search(r"[^aeiouy]{4}", w)],
-    )
-    emit(
-        "wrd-no-e-8plus",
-        "Name an 8+ letter English word that does not contain the letter E",
-        [(w, sc) for w, sc in dict_scored if len(w) >= 8 and "e" not in w],
-    )
-    emit(
-        "wrd-no-ae-7plus",
-        "Name a 7+ letter English word with neither A nor E",
-        [(w, sc) for w, sc in dict_scored if len(w) >= 7 and "a" not in w and "e" not in w],
-    )
+    emit("wrd-3-consec-vowels", "Name an English word with 3 consecutive vowels (e.g. beauty)",
+         [(w, sc) for w, sc in dict_scored if re.search(r"[aeiou]{3}", w)])
+    emit("wrd-4-consec-cons", "Name an English word with 4 consecutive consonants",
+         [(w, sc) for w, sc in dict_scored if re.search(r"[^aeiouy]{4}", w)])
+    emit("wrd-no-e-8plus", "Name an 8+ letter English word that does not contain the letter E",
+         [(w, sc) for w, sc in dict_scored if len(w) >= 8 and "e" not in w])
+    emit("wrd-no-ae-7plus", "Name a 7+ letter English word with neither A nor E",
+         [(w, sc) for w, sc in dict_scored if len(w) >= 7 and "a" not in w and "e" not in w])
     for v in "aeiou":
-        emit(
-            f"wrd-only-vowel-{v}",
-            f"Name a 5+ letter word whose only vowel is {v.upper()} (no other A/E/I/O/U)",
-            [(w, sc) for w, sc in dict_scored if len(w) >= 5 and (set(w) & vowels) == {v}],
-        )
-    emit(
-        "wrd-all-5-vowels",
-        "Name a word containing all 5 vowels (A, E, I, O, U)",
-        [(w, sc) for w, sc in dict_scored if vowels.issubset(set(w))],
-    )
-    emit(
-        "wrd-left-hand",
-        "Name a 5+ letter word typed using only the left hand on a QWERTY keyboard",
-        [(w, sc) for w, sc in dict_scored if len(w) >= 5 and set(w).issubset(left_hand)],
-    )
-    emit(
-        "wrd-right-hand",
-        "Name a 4+ letter word typed using only the right hand on a QWERTY keyboard",
-        [(w, sc) for w, sc in dict_scored if len(w) >= 4 and set(w).issubset(right_hand)],
-    )
-    emit(
-        "wrd-top-row",
-        "Name a 5+ letter word typed using only the top QWERTY letter row",
-        [(w, sc) for w, sc in dict_scored if len(w) >= 5 and set(w).issubset(top_row)],
-    )
-    emit(
-        "wrd-alpha-order",
-        "Name a 4+ letter word with all letters in alphabetical order (like 'almost')",
-        [(w, sc) for w, sc in dict_scored if len(w) >= 4 and list(w) == sorted(w)],
-    )
-    emit(
-        "wrd-isogram-8",
-        "Name an 8+ letter isogram (word with no repeated letters)",
-        [(w, sc) for w, sc in dict_scored if len(w) >= 8 and len(set(w)) == len(w)],
-    )
-    emit(
-        "wrd-isogram-9",
-        "Name a 9+ letter isogram (word with no repeated letters)",
-        [(w, sc) for w, sc in dict_scored if len(w) >= 9 and len(set(w)) == len(w)],
-    )
-    emit(
-        "wrd-isogram-10",
-        "Name a 10+ letter isogram (word with no repeated letters)",
-        [(w, sc) for w, sc in dict_scored if len(w) >= 10 and len(set(w)) == len(w)],
-    )
+        emit(f"wrd-only-vowel-{v}",
+             f"Name a 5+ letter word whose only vowel is {v.upper()} (no other A/E/I/O/U)",
+             [(w, sc) for w, sc in dict_scored if len(w) >= 5 and (set(w) & vowels) == {v}])
+    emit("wrd-all-5-vowels", "Name a word containing all 5 vowels (A, E, I, O, U)",
+         [(w, sc) for w, sc in dict_scored if vowels.issubset(set(w))])
+    emit("wrd-left-hand", "Name a 5+ letter word typed using only the left hand on a QWERTY keyboard",
+         [(w, sc) for w, sc in dict_scored if len(w) >= 5 and set(w).issubset(left_hand)])
+    emit("wrd-right-hand", "Name a 4+ letter word typed using only the right hand on a QWERTY keyboard",
+         [(w, sc) for w, sc in dict_scored if len(w) >= 4 and set(w).issubset(right_hand)])
+    emit("wrd-top-row", "Name a 5+ letter word typed using only the top QWERTY letter row",
+         [(w, sc) for w, sc in dict_scored if len(w) >= 5 and set(w).issubset(top_row)])
+    emit("wrd-alpha-order", "Name a 4+ letter word with all letters in alphabetical order (like 'almost')",
+         [(w, sc) for w, sc in dict_scored if len(w) >= 4 and list(w) == sorted(w)])
+    emit("wrd-isogram-8", "Name an 8+ letter isogram (word with no repeated letters)",
+         [(w, sc) for w, sc in dict_scored if len(w) >= 8 and len(set(w)) == len(w)])
+    emit("wrd-isogram-9", "Name a 9+ letter isogram (word with no repeated letters)",
+         [(w, sc) for w, sc in dict_scored if len(w) >= 9 and len(set(w)) == len(w)])
+    emit("wrd-isogram-10", "Name a 10+ letter isogram (word with no repeated letters)",
+         [(w, sc) for w, sc in dict_scored if len(w) >= 10 and len(set(w)) == len(w)])
+
+    for L in (5, 6, 7, 8):
+        for excl in ("e", "a", "i", "o", "s", "t", "r"):
+            emit(f"wrd-len{L}-no-{excl}",
+                 f"Name a {L}-letter English word with no letter {excl.upper()}",
+                 [(w, sc) for w, sc in dict_scored if len(w) == L and excl not in w])
+
+    for L in (5, 6, 7, 8, 9, 10):
+        for suf in ("ing", "ed", "er", "ly", "es", "al", "ic", "en", "tion", "ment", "ness", "able"):
+            emit(f"wrd-len{L}-suf-{suf}",
+                 f'Name a {L}-letter English word ending in "-{suf}"',
+                 [(w, sc) for w, sc in dict_scored if len(w) == L and w.endswith(suf)])
+
+    for L in (6, 7, 8, 9):
+        for pre in ("un", "re", "pre", "dis", "out", "over", "sub", "in", "co", "de"):
+            emit(f"wrd-len{L}-pre-{pre}",
+                 f'Name a {L}-letter English word starting with "{pre}-"',
+                 [(w, sc) for w, sc in dict_scored if len(w) == L and w.startswith(pre)])
+
+    for L in (5, 6, 7, 8, 9):
+        for sub in ("ch", "sh", "th", "qu", "oo", "ea", "ou", "ai", "st", "tr", "pr", "sp"):
+            emit(f"wrd-len{L}-sub-{sub}",
+                 f'Name a {L}-letter English word containing "{sub.upper()}"',
+                 [(w, sc) for w, sc in dict_scored if len(w) == L and sub in w])
+
+    for L in (5, 6, 7, 8, 9, 10):
+        for vcount in (1, 2, 3, 4):
+            emit(f"wrd-len{L}-v{vcount}",
+                 f"Name a {L}-letter English word with exactly {vcount} {'vowel' if vcount == 1 else 'vowels'} (A/E/I/O/U)",
+                 [(w, sc) for w, sc in dict_scored if len(w) == L and sum(1 for c in w if c in vowels) == vcount])
 
     return added
 
@@ -966,20 +1369,23 @@ def main() -> None:
     load_seed_and_existing(reg)
     print(f"   Loaded {len(reg.prompts)} prompts.")
 
-    print("2. Slicing large existing prompts by starting letter...")
-    n_sliced = slice_existing_prompts(reg)
-    print(f"   Added {n_sliced} letter-slice prompts (total: {len(reg.prompts)}).")
+    print("2. Deepening islands & archipelagos (Bonaire, Aruba, Curacao, territories)...")
+    deepen_islands_and_archipelagos(reg)
+    print(f"   geo-island: {reg.by_id['geo-island']['answerCount']}, geo-archipelago: {reg.by_id['geo-archipelago']['answerCount']}")
 
-    print("3. Fetching & slicing master Wikidata datasets...")
+    print("3. Fetching & slicing master Wikidata datasets (TV, anime, manga, songs, movies, cities, science, sports)...")
     n_wd = enrich_from_master_wikidata(reg)
     print(f"   Added {n_wd} Wikidata faceted prompts (total: {len(reg.prompts)}).")
 
-    print("4. Generating dictionary wordcraft prompts...")
+    print("4. Slicing large core prompts by starting letter (after island/movie deepening)...")
+    n_sliced = slice_existing_prompts(reg)
+    print(f"   Added {n_sliced} letter-slice prompts (total: {len(reg.prompts)}).")
+
+    print("5. Generating dictionary wordcraft prompts...")
     dict_scored = load_english_dictionary()
     n_words = generate_wordcraft_prompts(reg, dict_scored)
     print(f"   Added {n_words} wordcraft prompts (total: {len(reg.prompts)}).")
 
-    # Write 64 chunk files cleanly
     if OUT_CHUNKS_DIR.exists():
         shutil.rmtree(OUT_CHUNKS_DIR)
     OUT_CHUNKS_DIR.mkdir(parents=True, exist_ok=True)
@@ -1005,94 +1411,48 @@ def main() -> None:
         total_answers += p["answerCount"]
 
     for cid, payload in enumerate(chunks):
-        chunk_path = OUT_CHUNKS_DIR / f"chunk-{cid:02d}.json"
+        chunk_path = OUT_CHUNKS_DIR / f"chunk-{cid:03d}.json"
         chunk_path.write_text(
             json.dumps(payload, separators=(",", ":")), encoding="utf-8"
         )
 
-    # Keep the 4 Themed Packs mapped to their original 25-prompt pack IDs
     packs_meta = [
-        (
-            "words",
-            "WORDS & LANGUAGE",
-            "English quirks, loanwords, and lettercraft",
-            "chapters",
-            "#38bdf8",
-            [
-                ("Chapter 1: Letter Patterns", "Doubles, palindromes, silent letters & rare starters"),
-                ("Chapter 2: Borrowed Tongues", "Loanwords, sheet music & blended portmanteaus"),
-                ("Chapter 3: Quirky English", "Collective nouns, sound words, verbs & -ologies"),
-                ("Chapter 4: Rhetoric & Ink", "Punctuation, figures of speech, homophones & relics"),
-                ("Chapter 5: Lexicon Deep Dive", "Giant words, vowelless gems, NATO & crimsons"),
-            ],
-        ),
-        (
-            "movies",
-            "AT THE MOVIES",
-            "Oscars, animation, cults, directors & scores",
-            "pictures",
-            "#f05a84",
-            [
-                ("Reel 1: Classics & Oscars", "Best Picture, Pixar, Ghibli, Hitchcock & solo titles"),
-                ("Reel 2: Genre Vault", "Sci-fi, horror, Disney, 90s comedy & musicals"),
-                ("Reel 3: Worlds & Tropes", "Monsters, fictional planets, spies, heists & Westerns"),
-                ("Reel 4: Auteurs & Themes", "Directors, composers, time travel, space & sports"),
-                ("Reel 5: Cinema Lore", "007, Tarantino, holiday films, silents & Pixar pals"),
-            ],
-        ),
-        (
-            "sports",
-            "SPORTS",
-            "Olympians, pro leagues, tactics & arenas",
-            "games",
-            "#34d399",
-            [
-                ("Match 1: Global Stage", "Olympics, World Cup, Grand Slams, F1 & golf majors"),
-                ("Match 2: Pro Franchises", "NBA, NFL, MLB, NHL & Premier League clubs"),
-                ("Match 3: Rules & Craft", "Chess, weight classes, track & field, cricket & pitches"),
-                ("Match 4: Ice, Pool & Peak", "Winter Games, swimming, gymnastics, cycling & action"),
-                ("Match 5: Legends & Hardware", "Stadiums, rugby, Olympians, trophies & gear"),
-            ],
-        ),
-        (
-            "geography",
-            "GEOGRAPHY",
-            "Capitals, borders, rivers, peaks & islands",
-            "expeditions",
-            "#fbbf24",
-            [
-                ("Leg 1: Capitals & Cities", "Europe, US states, South America, Australia & Canada"),
-                ("Leg 2: Nations & Borders", "Landlocked, Asia, Africa, microstates & M-nations"),
-                ("Leg 3: Water & Landforms", "Rivers, mountain ranges, islands, deserts & seas"),
-                ("Leg 4: Wonders & Waters", "Landmarks, national parks, straits, lakes & peninsulas"),
-                ("Leg 5: Atlas Oddities", "Flag beasts, Mediterranean, non-Euro, archipelagos & falls"),
-            ],
-        ),
+        ("words", "WORDS & LANGUAGE", "English quirks, loanwords, and lettercraft", "chapters", "#38bdf8",
+         [("Chapter 1: Letter Patterns", "Doubles, palindromes, silent letters & rare starters"),
+          ("Chapter 2: Borrowed Tongues", "Loanwords, sheet music & blended portmanteaus"),
+          ("Chapter 3: Quirky English", "Collective nouns, sound words, verbs & -ologies"),
+          ("Chapter 4: Rhetoric & Ink", "Punctuation, figures of speech, homophones & relics"),
+          ("Chapter 5: Lexicon Deep Dive", "Giant words, vowelless gems, NATO & crimsons")]),
+        ("movies", "AT THE MOVIES", "Oscars, animation, cults, directors & scores", "pictures", "#f05a84",
+         [("Reel 1: Classics & Oscars", "Best Picture, Pixar, Ghibli, Hitchcock & solo titles"),
+          ("Reel 2: Genre Vault", "Sci-fi, horror, Disney, 90s comedy & musicals"),
+          ("Reel 3: Worlds & Tropes", "Monsters, fictional planets, spies, heists & Westerns"),
+          ("Reel 4: Auteurs & Themes", "Directors, composers, time travel, space & sports"),
+          ("Reel 5: Cinema Lore", "007, Tarantino, holiday films, silents & Pixar pals")]),
+        ("sports", "SPORTS", "Olympians, pro leagues, tactics & arenas", "games", "#34d399",
+         [("Match 1: Global Stage", "Olympics, World Cup, Grand Slams, F1 & golf majors"),
+          ("Match 2: Pro Franchises", "NBA, NFL, MLB, NHL & Premier League clubs"),
+          ("Match 3: Rules & Craft", "Chess, weight classes, track & field, cricket & pitches"),
+          ("Match 4: Ice, Pool & Peak", "Winter Games, swimming, gymnastics, cycling & action"),
+          ("Match 5: Legends & Hardware", "Stadiums, rugby, Olympians, trophies & gear")]),
+        ("geography", "GEOGRAPHY", "Capitals, borders, rivers, peaks & islands", "expeditions", "#fbbf24",
+         [("Leg 1: Capitals & Cities", "Europe, US states, South America, Australia & Canada"),
+          ("Leg 2: Nations & Borders", "Landlocked, Asia, Africa, microstates & M-nations"),
+          ("Leg 3: Water & Landforms", "Rivers, mountain ranges, islands, deserts & seas"),
+          ("Leg 4: Wonders & Waters", "Landmarks, national parks, straits, lakes & peninsulas"),
+          ("Leg 5: Atlas Oddities", "Flag beasts, Mediterranean, non-Euro, archipelagos & falls")]),
     ]
 
     seeds_raw: list[dict[str, Any]] = json.loads(SEED_PATH.read_text("utf-8"))
     themed_packs = []
     for cat_id, title, subtitle, unit_label, accent, ch_titles in packs_meta:
         cat_ids = [s["id"] for s in seeds_raw if s["category"] == cat_id]
-        chapters = []
-        for idx, (ctitle, csub) in enumerate(ch_titles):
-            chapters.append(
-                {
-                    "id": f"ch-{idx + 1}",
-                    "title": ctitle,
-                    "subtitle": csub,
-                    "promptIds": cat_ids[idx * 5 : idx * 5 + 5],
-                }
-            )
+        chapters = [
+            {"id": f"ch-{idx + 1}", "title": ctitle, "subtitle": csub, "promptIds": cat_ids[idx * 5 : idx * 5 + 5]}
+            for idx, (ctitle, csub) in enumerate(ch_titles)
+        ]
         themed_packs.append(
-            {
-                "id": cat_id,
-                "title": title,
-                "subtitle": subtitle,
-                "unitLabel": unit_label,
-                "accentColor": accent,
-                "chapters": chapters,
-            }
+            {"id": cat_id, "title": title, "subtitle": subtitle, "unitLabel": unit_label, "accentColor": accent, "chapters": chapters}
         )
 
     year_days = len(manifest_entries) // 7
@@ -1106,11 +1466,17 @@ def main() -> None:
     )
     OUT_MANIFEST_PATH.write_text(manifest_ts, encoding="utf-8")
 
-    from collections import Counter
+    pop_prefixes = (
+        "mov-", "gen-tv", "gen-anime", "gen-manga", "gen-song", "gen-vg", "gen-video-game",
+        "gen-band", "gen-singer", "gen-album", "gen-superhero", "gen-console", "gen-music-genre",
+        "gen-dog-cartoon", "gen-book", "gen-author", "gen-board-game", "gen-card-game", "gen-comic-char",
+    )
+    pop_count = sum(1 for m in manifest_entries if m["id"].startswith(pop_prefixes))
     cat_counts = Counter(m["category"] for m in manifest_entries)
-    print("\n=== FULL-YEAR DATABASE COMPLETE ===")
+    print("\n=== DATABASE COMPLETE ===")
     print(f"Total prompts: {len(manifest_entries):,} ({year_days} non-repeating daily dives!)")
     print(f"By category: {dict(cat_counts)}")
+    print(f"Pop-culture share: {pop_count:,} / {len(manifest_entries):,} ({pop_count / len(manifest_entries) * 100:.1f}%)")
     print(f"Total answers: {total_answers:,}")
 
 

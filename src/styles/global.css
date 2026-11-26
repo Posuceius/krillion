@@ -432,6 +432,76 @@ body.low-power .crt-scanlines::after {
   background: var(--border-bright);
 }
 
+/* Plunge Descent Animations */
+@keyframes plungeFloat {
+  0%, 100% {
+    transform: translateY(0px);
+  }
+  50% {
+    transform: translateY(4px);
+  }
+}
+
+@keyframes tierBannerPop {
+  0% {
+    transform: scale(0.88);
+    opacity: 0.4;
+  }
+  100% {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+
+@keyframes resultSlideUp {
+  0% {
+    transform: translateY(14px);
+    opacity: 0;
+  }
+  100% {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+
+.plunge-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 18px;
+  background: rgba(8, 17, 36, 0.9);
+  border: 2px solid var(--cyan);
+  box-shadow: 0 0 22px var(--cyan-glow);
+  font-family: var(--font-display);
+  font-size: 18px;
+  color: #ffffff;
+  letter-spacing: 0.06em;
+  animation: plungeFloat 0.6s ease-in-out infinite;
+}
+
+.tier-crossed-banner {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 14px;
+  background: rgba(7, 16, 32, 0.92);
+  border: 1px dashed currentColor;
+  font-family: var(--font-display);
+  font-size: 12px;
+  letter-spacing: 0.1em;
+  animation: tierBannerPop 0.2s ease-out;
+}
+
+.result-card-enter {
+  animation: resultSlideUp 0.28s ease-out;
+}
+
+body.low-power .plunge-pill,
+body.low-power .tier-crossed-banner,
+body.low-power .result-card-enter {
+  animation: none;
+}
+
 @media (max-width: 420px) {
   .hud-bar {
     grid-template-columns: 76px 1fr 76px;

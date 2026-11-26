@@ -1,10 +1,18 @@
 /**
- * Owns the full-bleed HTML5 2D ocean backdrop, depth color interpolation, particles, and buddy sprite rendering.
+ * Owns the full-bleed HTML5 2D ocean backdrop, depth color interpolation, particles, dashed tier thresholds, and buddy plunge rendering.
  * Does not manage game timers, scoring, or DOM HUD overlays.
  */
 import { useEffect, useRef } from 'react';
-import { BUDDY_SPRITES, type PixelSpriteData } from './pixelSprites';
-import type { BuddyId } from '../domain/types';
+import { BUDDY_SPRITES, TIER_SPRITES, type PixelSpriteData } from './pixelSprites';
+import { ACCEPTED_TIER_ORDER, TIERS } from '../domain/tiers';
+import type { BuddyId, TierId } from '../domain/types';
+
+export interface DescentVisualState {
+  active: boolean;
+  startDepth: number;
+  targetDepth: number;
+  tier: TierId;
+}
 
 interface OceanCanvasProps {
   targetDepth: number;
@@ -12,6 +20,8 @@ interface OceanCanvasProps {
   showBuddy: boolean;
   isDiving: boolean;
   lowPower: boolean;
+  colorblind?: boolean;
+  descentState?: DescentVisualState | null;
 }
 
 interface Particle {
@@ -29,6 +39,24 @@ interface BgFish {
   speed: number;
   scale: number;
   dir: 1 | -1;
+}
+
+interface PlungeBubble {
+  x: number;
+  y: number;
+  vy: number;
+  vx: number;
+  r: number;
+  alpha: number;
+}
+
+interface TierCritter {
+  x: number;
+  y: number;
+  vx: number;
+  vy: number;
+  sprite: PixelSpriteData;
+  life: number;
 }
 
 function lerp(a: number, b: number, t: number): number {
@@ -49,25 +77,28 @@ function drawSprite(
   cx: number,
   cy: number,
   pixelSize: number,
-  flipX = false
+  rotationRad = 0
 ) {
-  const startX = cx - (sprite.width * pixelSize) / 2;
-  const startY = cy - (sprite.height * pixelSize) / 2;
+  ctx.save();
+  ctx.translate(cx, cy);
+  if (rotationRad !== 0) ctx.rotate(rotationRad);
+  const startX = -(sprite.width * pixelSize) / 2;
+  const startY = -(sprite.height * pixelSize) / 2;
   for (let y = 0; y < sprite.rows.length; y++) {
     const row = sprite.rows[y];
     for (let x = 0; x < row.length; x++) {
       const ch = row[x];
       if (ch === '.') continue;
       ctx.fillStyle = sprite.palette[ch] ?? '#ffffff';
-      const drawX = flipX ? sprite.width - 1 - x : x;
       ctx.fillRect(
-        Math.round(startX + drawX * pixelSize),
+        Math.round(startX + x * pixelSize),
         Math.round(startY + y * pixelSize),
         Math.ceil(pixelSize),
         Math.ceil(pixelSize)
       );
     }
   }
+  ctx.restore();
 }
 
 export function OceanCanvas({
@@ -76,6 +107,8 @@ export function OceanCanvas({
   showBuddy,
   isDiving,
   lowPower,
+  colorblind = false,
+  descentState = null,
 }: OceanCanvasProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const stateRef = useRef({
@@ -85,6 +118,9 @@ export function OceanCanvas({
     showBuddy,
     isDiving,
     lowPower,
+    colorblind,
+    descentState,
+    lastThresholdCrossed: 0,
   });
 
   stateRef.current.targetDepth = targetDepth;
@@ -92,6 +128,8 @@ export function OceanCanvas({
   stateRef.current.showBuddy = showBuddy;
   stateRef.current.isDiving = isDiving;
   stateRef.current.lowPower = lowPower;
+  stateRef.current.colorblind = colorblind;
+  stateRef.current.descentState = descentState;
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -99,7 +137,7 @@ export function OceanCanvas({
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
-    const particles: Particle[] = Array.from({ length: 42 }, (_, i) => ({
+    const particles: Particle[] = Array.from({ length: 48 }, (_, i) => ({
       x: Math.random(),
       y: Math.random(),
       r: 1.5 + (i % 3) * 1.2,
@@ -115,6 +153,9 @@ export function OceanCanvas({
       scale: 2 + (i % 2),
       dir: i % 2 === 0 ? 1 : -1,
     }));
+
+    const plungeBubbles: PlungeBubble[] = [];
+    const critters: TierCritter[] = [];
 
     const resize = () => {
       const dpr = Math.min(window.devicePixelRatio || 1, 2);
@@ -136,11 +177,22 @@ export function OceanCanvas({
       lastTime = now;
 
       const s = stateRef.current;
-      s.currentDepth = lerp(s.currentDepth, s.targetDepth, Math.min(1, dt * 4.5));
+      const prevDepth = s.currentDepth;
+      const isActivelyPlunging = Boolean(s.descentState?.active);
+
+      if (isActivelyPlunging) {
+        // Track DiveView's rAF targetDepth tightly during plunge
+        s.currentDepth = lerp(s.currentDepth, s.targetDepth, Math.min(1, dt * 16));
+      } else {
+        s.currentDepth = lerp(s.currentDepth, s.targetDepth, Math.min(1, dt * 5.0));
+        s.lastThresholdCrossed = 0;
+      }
+
       if (Math.abs(s.currentDepth - s.targetDepth) < 0.2) {
         s.currentDepth = s.targetDepth;
       }
 
+      const depthDelta = Math.max(0, s.currentDepth - prevDepth);
       const w = window.innerWidth;
       const h = window.innerHeight;
       const depth = s.currentDepth;
@@ -178,7 +230,6 @@ export function OceanCanvas({
           ctx.fillStyle = skyGrad;
           ctx.fillRect(0, 0, w, horizonY);
 
-          // Sun glow
           const sunX = w * 0.5 + 130;
           const sunY = horizonY * 0.62;
           const sunGrad = ctx.createRadialGradient(sunX, sunY, 8, sunX, sunY, 56);
@@ -190,7 +241,6 @@ export function OceanCanvas({
           ctx.arc(sunX, sunY, 56, 0, Math.PI * 2);
           ctx.fill();
 
-          // Pixel clouds
           ctx.fillStyle = 'rgba(255, 255, 255, 0.88)';
           const cloudOffset = s.lowPower ? 0 : ((now * 0.008) % (w + 180)) - 90;
           const drawCloud = (cx: number, cy: number, scale: number) => {
@@ -201,7 +251,6 @@ export function OceanCanvas({
           drawCloud((w * 0.5 - 160 + cloudOffset * 0.25) % (w + 80) - 40, horizonY * 0.35, 1.1);
           drawCloud(w * 0.5 + 55, horizonY * 0.52, 0.9);
 
-          // Tiny pixel boat on horizon
           const boatX = w * 0.5 - 110;
           const boatBob = s.lowPower ? 0 : Math.sin(now * 0.0025) * 2;
           const by = horizonY - 4 + boatBob;
@@ -212,7 +261,6 @@ export function OceanCanvas({
           ctx.fillStyle = '#f43f5e';
           ctx.fillRect(boatX + 8, by - 16, 8, 5);
 
-          // Ocean wave line
           ctx.fillStyle = '#1b5080';
           ctx.fillRect(0, horizonY, w, 6);
         }
@@ -234,15 +282,16 @@ export function OceanCanvas({
         }
       }
 
-      // Side kelp silhouettes in shallow/twilight waters
+      // Side kelp silhouettes in shallow/twilight waters (scrolls upward with depth!)
       if (depth < 1200) {
         const kelpAlpha = Math.max(0, 0.38 * (1 - depth / 1200));
         ctx.fillStyle = `rgba(6, 18, 36, ${kelpAlpha})`;
         const baseL = Math.max(0, w * 0.5 - 240);
         const baseR = Math.min(w - 28, w * 0.5 + 210);
-        for (let k = 0; k < 14; k++) {
+        const scrollOffset = (depth * 1.4) % 48;
+        for (let k = -2; k < 16; k++) {
           const sway = s.lowPower ? 0 : Math.sin(now * 0.002 + k * 0.6) * 4;
-          const yPos = h - k * 24;
+          const yPos = h - k * 24 - scrollOffset;
           ctx.fillRect(baseL + sway + (k % 2) * 8, yPos, 14, 18);
           ctx.fillRect(baseR - sway - (k % 2) * 6, yPos - 10, 14, 18);
         }
@@ -253,8 +302,10 @@ export function OceanCanvas({
         ctx.fillStyle = 'rgba(4, 12, 26, 0.55)';
         for (const f of fishes) {
           f.x += f.speed * f.dir * dt;
+          f.y -= (depthDelta / 500);
           if (f.x > 1.1) f.x = -0.1;
           if (f.x < -0.1) f.x = 1.1;
+          if (f.y < -0.05) f.y = 1.05;
           const fx = f.x * w;
           const fy = f.y * h;
           ctx.fillRect(fx, fy, 12 * f.scale, 5 * f.scale);
@@ -267,10 +318,11 @@ export function OceanCanvas({
         }
       }
 
-      // Bubbles and abyssal motes
+      // Bubbles and abyssal motes (accelerate upward during descent plunge!)
       if (!s.lowPower) {
+        const extraUp = depthDelta / 420;
         for (const p of particles) {
-          p.y -= p.speed * dt;
+          p.y -= p.speed * dt + extraUp;
           if (p.y < -0.05) {
             p.y = 1.05;
             p.x = Math.random();
@@ -296,13 +348,119 @@ export function OceanCanvas({
         }
       }
 
-      // Equipped Dive Buddy sprite
+      // Dashed horizontal tier threshold lines during active descent plunge
+      const buddyX = isActivelyPlunging
+        ? w * 0.5 + 88
+        : s.isDiving
+          ? Math.max(54, w * 0.5 - 145)
+          : Math.max(60, w * 0.5 - 125);
+      const bob = s.lowPower ? 0 : Math.sin(now * (isActivelyPlunging ? 0.014 : 0.004)) * 5;
+      const buddyY = (isActivelyPlunging ? h * 0.48 : s.isDiving ? h * 0.72 : h * 0.49) + bob;
+
+      if (isActivelyPlunging && s.descentState) {
+        const pxPerMeter = 1.85;
+        const laneLeft = Math.max(20, w * 0.5 - 210);
+        const laneRight = Math.min(w - 60, w * 0.5 + 185);
+
+        for (let idx = 0; idx < ACCEPTED_TIER_ORDER.length; idx++) {
+          const tId = ACCEPTED_TIER_ORDER[idx];
+          const tDef = TIERS[tId];
+          const lineDepth = s.descentState.startDepth + tDef.depthMeters;
+          if (lineDepth > s.descentState.targetDepth + 25) continue;
+
+          const lineY = buddyY + (lineDepth - depth) * pxPerMeter;
+          const crossed = depth >= lineDepth;
+
+          // Spawn burst of tier critters when crossing a threshold!
+          if (crossed && s.lastThresholdCrossed < idx + 1) {
+            s.lastThresholdCrossed = idx + 1;
+            if (!s.lowPower) {
+              const burstCount = idx >= 4 ? 6 : 4;
+              for (let k = 0; k < burstCount; k++) {
+                critters.push({
+                  x: w * 0.5 + (Math.random() - 0.5) * 200,
+                  y: buddyY + 30 + Math.random() * 40,
+                  vx: (Math.random() - 0.5) * 90,
+                  vy: -80 - Math.random() * 110,
+                  sprite: TIER_SPRITES[tId],
+                  life: 1.0,
+                });
+              }
+            }
+          }
+
+          if (lineY > 65 && lineY < h - 40) {
+            const lineColor = s.colorblind ? tDef.colorblindColor : tDef.color;
+            ctx.save();
+            ctx.strokeStyle = crossed ? lineColor : 'rgba(155, 180, 212, 0.42)';
+            ctx.lineWidth = crossed ? 2 : 1.2;
+            ctx.setLineDash([6, 6]);
+            ctx.beginPath();
+            ctx.moveTo(laneLeft, lineY);
+            ctx.lineTo(laneRight, lineY);
+            ctx.stroke();
+            ctx.restore();
+
+            ctx.font = 'bold 11px "Silkscreen", monospace';
+            ctx.fillStyle = crossed ? lineColor : 'rgba(195, 220, 245, 0.65)';
+            ctx.textAlign = 'right';
+            ctx.fillText(`${tDef.shortLabel} · ${tDef.points}`, laneRight, lineY - 6);
+          }
+        }
+
+        // Dense bubble stream trailing behind the plunging buddy
+        if (!s.lowPower && depthDelta > 0.2) {
+          for (let b = 0; b < 3; b++) {
+            plungeBubbles.push({
+              x: buddyX + (Math.random() - 0.5) * 22,
+              y: buddyY - 12 + (Math.random() - 0.5) * 12,
+              vy: -130 - Math.random() * 140,
+              vx: (Math.random() - 0.5) * 35,
+              r: 2 + Math.random() * 4.5,
+              alpha: 0.75,
+            });
+          }
+        }
+      }
+
+      // Update & draw plunge bubble stream
+      for (let i = plungeBubbles.length - 1; i >= 0; i--) {
+        const b = plungeBubbles[i];
+        b.x += b.vx * dt;
+        b.y += b.vy * dt;
+        b.alpha -= dt * 0.65;
+        if (b.alpha <= 0 || b.y < 30) {
+          plungeBubbles.splice(i, 1);
+          continue;
+        }
+        ctx.strokeStyle = `rgba(205, 240, 255, ${b.alpha})`;
+        ctx.lineWidth = 1.4;
+        ctx.beginPath();
+        ctx.arc(b.x, b.y, b.r, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+
+      // Update & draw tier-crossing pixel sprites
+      for (let i = critters.length - 1; i >= 0; i--) {
+        const c = critters[i];
+        c.x += c.vx * dt;
+        c.y += c.vy * dt;
+        c.life -= dt * 0.85;
+        if (c.life <= 0 || c.y < 40) {
+          critters.splice(i, 1);
+          continue;
+        }
+        ctx.save();
+        ctx.globalAlpha = Math.max(0, Math.min(1, c.life));
+        drawSprite(ctx, c.sprite, c.x, c.y, 1.8);
+        ctx.restore();
+      }
+
+      // Equipped Dive Buddy sprite (tilts head-first when plunging!)
       if (s.showBuddy) {
         const sprite = BUDDY_SPRITES[s.buddyId] ?? BUDDY_SPRITES.krill;
-        const buddyX = s.isDiving ? Math.max(54, w * 0.5 - 145) : Math.max(60, w * 0.5 - 125);
-        const bob = s.lowPower ? 0 : Math.sin(now * 0.004) * 5;
-        const buddyY = (s.isDiving ? h * 0.72 : h * 0.49) + bob;
-        drawSprite(ctx, sprite, buddyX, buddyY, 2.8);
+        const tilt = isActivelyPlunging ? 0.35 : 0;
+        drawSprite(ctx, sprite, buddyX, buddyY, isActivelyPlunging ? 3.2 : 2.8, tilt);
       }
 
       rafId = window.requestAnimationFrame(frame);

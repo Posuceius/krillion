@@ -3,7 +3,7 @@
  * Does not implement answer matching, scoring formulas, or canvas rendering directly.
  */
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { OceanCanvas } from './art/OceanCanvas';
+import { OceanCanvas, type DescentVisualState } from './art/OceanCanvas';
 import { soundEngine } from './audio/soundEngine';
 import { ArchiveView } from './components/ArchiveView';
 import { DiveView } from './components/DiveView';
@@ -96,6 +96,7 @@ export function App() {
   const [loadingLabel, setLoadingLabel] = useState<string | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [canvasDepth, setCanvasDepth] = useState(0);
+  const [descentVisual, setDescentVisual] = useState<DescentVisualState | null>(null);
   const [recentUnlimitedPromptIds, setRecentUnlimitedPromptIds] = useState<string[]>([]);
 
   const [menuOpen, setMenuOpen] = useState(false);
@@ -322,6 +323,8 @@ export function App() {
         showBuddy={showBuddyOnCanvas}
         isDiving={Boolean(activeSession || loadingLabel)}
         lowPower={appState.settings.lowPowerMode}
+        colorblind={appState.settings.colorblindMode}
+        descentState={descentVisual}
       />
 
       <div className="stage">
@@ -382,6 +385,7 @@ export function App() {
             onProgress={handleDiveProgress}
             onComplete={handleDiveComplete}
             onDepthChange={setCanvasDepth}
+            onDescentVisualChange={setDescentVisual}
             onPlayAgain={
               activeSession.mode === 'unlimited'
                 ? startUnlimitedDive

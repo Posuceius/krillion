@@ -60,7 +60,7 @@ async function loadChunk(chunkId: number): Promise<RawChunkPayload> {
   const inflight = inflightChunks.get(chunkId);
   if (inflight) return inflight;
 
-  const fileNum = String(chunkId).padStart(2, '0');
+  const fileNum = String(chunkId).padStart(3, '0');
   const promise = fetch(`./data/chunks/chunk-${fileNum}.json`)
     .then(async (res) => {
       if (!res.ok) {
