@@ -18,8 +18,9 @@ import { UnlimitedView } from './components/UnlimitedView';
 import { WardrobeModal } from './components/WardrobeModal';
 import {
   PROMPT_MANIFEST,
+  PROMPT_META_BY_ID,
   TOTAL_ANSWER_COUNT,
-  preloadPrompts,
+  warmupDatabase,
 } from './data';
 import {
   dateStringFromDiveNumber,
@@ -34,7 +35,7 @@ import type {
   DiveMode,
   DiveRunRecord,
   PersistedAppState,
-  Prompt,
+  PromptMeta,
   RoundResult,
   ThemedPack,
   UserSettings,
@@ -53,7 +54,7 @@ interface ActiveSession {
   dateEt?: string;
   packId?: string;
   chapterIndex?: number;
-  prompts: Prompt[];
+  prompts: PromptMeta[];
   initialRounds?: RoundResult[];
   initialIndex?: number;
   completedRun?: DiveRunRecord;
@@ -174,14 +175,19 @@ export function App() {
     setLoadError(null);
     setLoadingLabel(sessionBase.label);
     try {
-      const prompts = await preloadPrompts(promptIds);
+      const prompts = promptIds.map((id) => {
+        const meta = PROMPT_META_BY_ID[id];
+        if (!meta) throw new Error(`Unknown prompt id: ${id}`);
+        return meta;
+      });
+      await warmupDatabase();
       setCanvasDepth(targetDepth);
       setActiveSession({
         ...sessionBase,
         prompts,
       });
     } catch (err) {
-      setLoadError(err instanceof Error ? err.message : 'Failed to load prompt data');
+      setLoadError(err instanceof Error ? err.message : 'Failed to initialize prompt database');
     } finally {
       setLoadingLabel(null);
     }

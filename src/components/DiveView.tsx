@@ -7,7 +7,7 @@ import { soundEngine } from '../audio/soundEngine';
 import type { DescentVisualState } from '../art/OceanCanvas';
 import { TIER_SPRITES } from '../art/pixelSprites';
 import { PixelSpriteSvg } from '../art/PixelSpriteSvg';
-import { buildPromptIndex, matchPromptAnswer } from '../domain/matcher';
+import { matchPromptAnswerRemote } from '../data';
 import { calculateTotals } from '../domain/scoring';
 import { ACCEPTED_TIER_ORDER, TIERS } from '../domain/tiers';
 import type {
@@ -15,7 +15,7 @@ import type {
   DiveMode,
   DiveRunRecord,
   MatchResult,
-  Prompt,
+  PromptMeta,
   RoundResult,
   TierId,
   UserSettings,
@@ -44,7 +44,7 @@ interface DiveViewProps {
   dateEt?: string;
   packId?: string;
   chapterIndex?: number;
-  prompts: Prompt[];
+  prompts: PromptMeta[];
   initialRounds?: RoundResult[];
   initialIndex?: number;
   completedRun?: DiveRunRecord;
@@ -92,17 +92,15 @@ export function DiveView({
   const [rejectedText, setRejectedText] = useState<string | null>(null);
   const [pendingCorrection, setPendingCorrection] = useState<MatchResult | null>(null);
   const [latestRound, setLatestRound] = useState<RoundResult | null>(null);
+  const [isChecking, setIsChecking] = useState(false);
 
   const [plungeDepth, setPlungeDepth] = useState<number>(() => calculateTotals(initialRounds).totalDepth);
   const [crossedTier, setCrossedTier] = useState<TierId>('miss');
   const plungeRafRef = useRef<number | null>(null);
+  const roundTokenRef = useRef(0);
 
   const inputRef = useRef<HTMLInputElement | null>(null);
   const activePrompt = prompts[currentIndex];
-  const promptIndex = useMemo(
-    () => (activePrompt ? buildPromptIndex(activePrompt) : undefined),
-    [activePrompt]
-  );
 
   const settledTotals = useMemo(() => {
     if (finishedRun) {
@@ -194,6 +192,8 @@ export function DiveView({
   }, [phase, currentIndex]);
 
   const finalizeRound = (result: RoundResult) => {
+    roundTokenRef.current += 1;
+    setIsChecking(false);
     const startDepth = calculateTotals(rounds).totalDepth;
     const endDepth = startDepth + result.depthMeters;
     const nextRounds = [...rounds, result];
@@ -274,39 +274,48 @@ export function DiveView({
     });
   };
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (phase !== 'answering' || !activePrompt) return;
+    if (phase !== 'answering' || !activePrompt || isChecking) return;
 
     const trimmed = inputValue.trim();
     if (!trimmed) return;
 
-    const match = matchPromptAnswer(
-      activePrompt,
-      trimmed,
-      promptIndex,
-      settings.answerCorrections
-    );
+    const token = ++roundTokenRef.current;
+    setIsChecking(true);
+    try {
+      const match = await matchPromptAnswerRemote(
+        activePrompt,
+        trimmed,
+        settings.answerCorrections
+      );
 
-    if (match.kind === 'no_echo') {
-      soundEngine.rejectBuzz();
-      setRejectedText(`"${trimmed}": no echo. try again`);
-      setPendingCorrection(null);
-      if (settings.clearRejectedEntries) {
-        setInputValue('');
+      if (roundTokenRef.current !== token) return;
+
+      if (match.kind === 'no_echo') {
+        soundEngine.rejectBuzz();
+        setRejectedText(`"${trimmed}": no echo. try again`);
+        setPendingCorrection(null);
+        if (settings.clearRejectedEntries) {
+          setInputValue('');
+        }
+        inputRef.current?.focus();
+        return;
       }
-      inputRef.current?.focus();
-      return;
-    }
 
-    if (match.needsConfirmation) {
-      soundEngine.click();
-      setRejectedText(null);
-      setPendingCorrection(match);
-      return;
-    }
+      if (match.needsConfirmation) {
+        soundEngine.click();
+        setRejectedText(null);
+        setPendingCorrection(match);
+        return;
+      }
 
-    acceptMatch(match);
+      acceptMatch(match);
+    } finally {
+      if (roundTokenRef.current === token) {
+        setIsChecking(false);
+      }
+    }
   };
 
   const handleAdvance = () => {
@@ -571,8 +580,13 @@ export function DiveView({
                   </div>
                 </div>
 
-                <button type="submit" className="btn-pixel btn-pink" style={{ height: 52, padding: '0 16px' }}>
-                  DIVE
+                <button
+                  type="submit"
+                  className="btn-pixel btn-pink"
+                  style={{ height: 52, padding: '0 16px' }}
+                  disabled={isChecking}
+                >
+                  {isChecking ? '...' : 'DIVE'}
                 </button>
               </form>
             </div>

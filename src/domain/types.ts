@@ -26,7 +26,9 @@ export interface PromptMeta {
   text: string;
   category: PromptCategory;
   answerCount: number;
-  chunk: number;
+  dbId: number;
+  formLevel: 0 | 1 | 2;
+  packOnly?: boolean;
 }
 
 export interface Prompt {

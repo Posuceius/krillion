@@ -1,243 +1,268 @@
 /**
- * Owns automated integrity checks across all 256 static prompt chunks, Bonaire/island coverage, fixed Wikidata categories, aliases, and manifest metadata.
- * Does not mutate repository data or run in production bundles.
+ * Owns automated integrity and lookup checks across the chunked SQLite database, manifest parity, broad-trivia guarantees, and human-friendly matching.
+ * Does not mutate repository files or run in browser bundles.
  */
-import { readFileSync, statSync } from 'node:fs';
-import { resolve } from 'node:path';
-import { describe, expect, it } from 'vitest';
-import {
-  buildPromptIndex,
-  matchPromptAnswer,
-  normalizeAnswer,
-} from '../domain/matcher';
-import { ACCEPTED_TIER_ORDER } from '../domain/tiers';
+import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import {
   PROMPT_MANIFEST,
   PROMPT_META_BY_ID,
   THEMED_PACKS,
   TOTAL_ANSWER_COUNT,
   YEAR_COVERAGE_DAYS,
-  parsePromptJson,
-  type RawPromptEntry,
+  loadPromptTierSamples,
+  matchPromptAnswerRemote,
+  searchPromptAnswers,
+  setQueryExecutorForTests,
 } from './index';
 
-const NUM_CHUNKS = 256;
-
-function loadAllChunksFromDisk(): Record<number, Record<string, RawPromptEntry>> {
-  const chunks: Record<number, Record<string, RawPromptEntry>> = {};
-  for (let cid = 0; cid < NUM_CHUNKS; cid++) {
-    const fileNum = String(cid).padStart(3, '0');
-    const filePath = resolve(
-      process.cwd(),
-      'public',
-      'data',
-      'chunks',
-      `chunk-${fileNum}.json`
-    );
-    chunks[cid] = JSON.parse(readFileSync(filePath, 'utf-8'));
-  }
-  return chunks;
+interface ChunkedDbConfig {
+  serverMode: string;
+  requestChunkSize: number;
+  databaseLengthBytes: number;
+  serverChunkSize: number;
+  urlPrefix: string;
+  suffixLength: number;
 }
 
-describe('prompt catalog integrity (v1.2.0 expanded 4,100+ prompts & aliases)', () => {
-  it('covers 570+ non-repeating daily dives (>= 4,000 unique prompts)', () => {
-    expect(PROMPT_MANIFEST.length).toBeGreaterThanOrEqual(4000);
-    expect(YEAR_COVERAGE_DAYS).toBeGreaterThanOrEqual(570);
+const DB_DIR = resolve(process.cwd(), 'public', 'data', 'db');
+
+let tempDir: string | null = null;
+let dbInstance: {
+  prepare: (sql: string) => { all: (...params: unknown[]) => Record<string, unknown>[] };
+  close: () => void;
+} | null = null;
+let dbConfig: ChunkedDbConfig;
+
+beforeAll(async () => {
+  dbConfig = JSON.parse(
+    readFileSync(join(DB_DIR, 'config.json'), 'utf-8')
+  ) as ChunkedDbConfig;
+
+  const numParts = Math.ceil(
+    dbConfig.databaseLengthBytes / dbConfig.serverChunkSize
+  );
+  const buffers: Buffer[] = [];
+  for (let i = 0; i < numParts; i++) {
+    const suffix = String(i).padStart(dbConfig.suffixLength, '0');
+    const chunkPath = join(DB_DIR, `${dbConfig.urlPrefix}${suffix}`);
+    const stat = statSync(chunkPath);
+    expect(stat.size).toBeLessThanOrEqual(10.5 * 1024 * 1024);
+    buffers.push(readFileSync(chunkPath));
+  }
+
+  const combined = Buffer.concat(buffers);
+  expect(combined.length).toBe(dbConfig.databaseLengthBytes);
+  expect(combined.length).toBeLessThan(220 * 1024 * 1024);
+
+  tempDir = mkdtempSync(join(tmpdir(), 'krillion-db-test-'));
+  const sqliteFile = join(tempDir, 'krillion.sqlite3');
+  writeFileSync(sqliteFile, combined);
+
+  const { DatabaseSync } = await import('node:sqlite');
+  const db = new DatabaseSync(sqliteFile, { readOnly: true });
+  dbInstance = db;
+
+  setQueryExecutorForTests({
+    async query(sql, params = []) {
+      return db.prepare(sql).all(...params) as never[];
+    },
+  });
+});
+
+afterAll(() => {
+  setQueryExecutorForTests(null);
+  dbInstance?.close();
+  if (tempDir) {
+    rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+describe('SQLite static database & broad-trivia catalog (v1.3.0)', () => {
+  it('covers 365+ non-repeating daily dives using broad trivia without letter/wordcraft slices', () => {
+    const dailyEligible = PROMPT_MANIFEST.filter((p) => !p.packOnly);
+    expect(dailyEligible.length).toBeGreaterThanOrEqual(2555);
+    expect(YEAR_COVERAGE_DAYS).toBe(Math.floor(dailyEligible.length / 7));
+    expect(YEAR_COVERAGE_DAYS).toBeGreaterThanOrEqual(365);
 
     const ids = new Set(PROMPT_MANIFEST.map((p) => p.id));
     const texts = new Set(PROMPT_MANIFEST.map((p) => p.text.toLowerCase()));
     expect(ids.size).toBe(PROMPT_MANIFEST.length);
     expect(texts.size).toBe(PROMPT_MANIFEST.length);
-    expect(TOTAL_ANSWER_COUNT).toBeGreaterThanOrEqual(1_100_000);
+    expect(TOTAL_ANSWER_COUNT).toBeGreaterThanOrEqual(2_000_000);
+
+    for (const meta of dailyEligible) {
+      expect(meta.text).not.toContain('starting with the letter ');
+      expect(meta.text).not.toMatch(/^\s*Name a \d+-letter English word/);
+    }
   });
 
-  it('validates all 256 chunk files (6 tiers, >= 30 answers, >= 300k aliases, zero collisions)', () => {
-    const chunks = loadAllChunksFromDisk();
-    const errors: string[] = [];
+  it('validates manifest parity, 6 tiers, and >= 30 answers per prompt inside SQLite', () => {
+    expect(dbInstance).not.toBeNull();
+    const promptRows = dbInstance!
+      .prepare('SELECT id, slug, category, form_level, pack_only, answer_count FROM prompts')
+      .all();
+    expect(promptRows.length).toBe(PROMPT_MANIFEST.length);
+
+    const bySlug = new Map(promptRows.map((r) => [String(r.slug), r]));
+    const tierCountsRows = dbInstance!
+      .prepare('SELECT prompt_id, tier, COUNT(*) AS cnt FROM prompt_answers GROUP BY prompt_id, tier')
+      .all();
+
+    const tiersByPrompt = new Map<number, Map<number, number>>();
+    for (const row of tierCountsRows) {
+      const pid = Number(row.prompt_id);
+      let m = tiersByPrompt.get(pid);
+      if (!m) {
+        m = new Map<number, number>();
+        tiersByPrompt.set(pid, m);
+      }
+      m.set(Number(row.tier), Number(row.cnt));
+    }
+
     let summedAnswers = 0;
-    let totalAliases = 0;
-
-    let totalChunkBytes = 0;
-    for (let cid = 0; cid < NUM_CHUNKS; cid++) {
-      const fileNum = String(cid).padStart(3, '0');
-      const filePath = resolve(
-        process.cwd(),
-        'public',
-        'data',
-        'chunks',
-        `chunk-${fileNum}.json`
-      );
-      totalChunkBytes += statSync(filePath).size;
-    }
-    expect(totalChunkBytes).toBeLessThan(65 * 1024 * 1024);
-
     for (const meta of PROMPT_MANIFEST) {
-      const chunkPayload = chunks[meta.chunk];
-      const raw = chunkPayload?.[meta.id];
-      if (!raw) {
-        errors.push(`${meta.id}: missing from chunk-${meta.chunk}`);
-        continue;
-      }
+      const dbRow = bySlug.get(meta.id);
+      expect(dbRow, `Missing ${meta.id} in SQLite`).toBeDefined();
+      expect(Number(dbRow!.id)).toBe(meta.dbId);
+      expect(Number(dbRow!.answer_count)).toBe(meta.answerCount);
+      expect(meta.answerCount).toBeGreaterThanOrEqual(30);
+      summedAnswers += meta.answerCount;
 
-      const prompt = parsePromptJson(meta, raw);
-      if (prompt.answers.length !== meta.answerCount) {
-        errors.push(
-          `${meta.id}: manifest count ${meta.answerCount} != json count ${prompt.answers.length}`
-        );
-      }
-      if (prompt.answers.length < 30) {
-        errors.push(`${meta.id}: only ${prompt.answers.length} answers (need >= 30)`);
-      }
-
-      summedAnswers += prompt.answers.length;
-
-      const seenTiers = new Set<string>();
-      const normalizedSeen = new Map<string, { tier: string; canonical: string }>();
-
-      for (const entry of prompt.answers) {
-        seenTiers.add(entry.tier);
-        totalAliases += entry.aliases?.length ?? 0;
-        const forms = [entry.canonical, ...(entry.aliases ?? [])];
-        for (const form of forms) {
-          const norm = normalizeAnswer(form);
-          if (!norm) {
-            errors.push(`${meta.id}: empty normalized form "${form}"`);
-            continue;
-          }
-          const prev = normalizedSeen.get(norm);
-          if (prev && prev.tier !== entry.tier) {
-            errors.push(
-              `${meta.id}: collision "${norm}" in both ${prev.tier} (${prev.canonical}) and ${entry.tier} (${entry.canonical})`
-            );
-          } else if (!prev) {
-            normalizedSeen.set(norm, { tier: entry.tier, canonical: entry.canonical });
-          }
-        }
-      }
-
-      for (const reqTier of ACCEPTED_TIER_ORDER) {
-        if (!seenTiers.has(reqTier)) {
-          errors.push(`${meta.id}: missing tier ${reqTier}`);
-        }
+      const tMap = tiersByPrompt.get(meta.dbId);
+      expect(tMap?.size).toBe(6);
+      for (let t = 0; t < 6; t++) {
+        expect(tMap!.get(t) ?? 0).toBeGreaterThan(0);
       }
     }
-
-    expect(errors).toEqual([]);
     expect(summedAnswers).toBe(TOTAL_ANSWER_COUNT);
-    expect(totalAliases).toBeGreaterThanOrEqual(300_000);
   });
 
-  it('includes Bonaire, Aruba, and Curacao across island and archipelago prompts', () => {
-    const chunks = loadAllChunksFromDisk();
-    for (const pid of ['geo-island', 'geo-archipelago']) {
-      const meta = PROMPT_META_BY_ID[pid];
-      expect(meta).toBeDefined();
-      const prompt = parsePromptJson(meta, chunks[meta.chunk][pid]);
-      const idx = buildPromptIndex(prompt);
-      for (const ans of ['Bonaire', 'Aruba', 'Curaçao']) {
-        const res = matchPromptAnswer(prompt, ans, idx);
-        expect(res.kind).not.toBe('no_echo');
-      }
-    }
-
-    const bMeta = PROMPT_META_BY_ID['geo-island-ltr-b'];
-    expect(bMeta).toBeDefined();
-    const bPrompt = parsePromptJson(bMeta, chunks[bMeta.chunk][bMeta.id]);
-    expect(matchPromptAnswer(bPrompt, 'Bonaire').kind).not.toBe('no_echo');
-
-    const aMeta = PROMPT_META_BY_ID['geo-island-ltr-a'];
-    expect(aMeta).toBeDefined();
-    const aPrompt = parsePromptJson(aMeta, chunks[aMeta.chunk][aMeta.id]);
-    expect(matchPromptAnswer(aPrompt, 'Aruba').kind).not.toBe('no_echo');
-  });
-
-  it('verifies all 6 fixed Wikidata queries, fish, 1950s movies, stars, authors, and broadened Americas cities', () => {
-    const chunks = loadAllChunksFromDisk();
+  it('scales mega-prompts and batched Wikidata pools to tens of thousands of answers', () => {
     const minCounts: Record<string, number> = {
-      'gen-nobel': 500,
-      'gen-compound': 1000,
-      'gen-grape': 500,
-      'gen-vg-strategy': 500,
-      'gen-vg-horror': 150,
-      'gen-fish': 1000,
-      'mov-decade-1950s': 800,
-      'gen-star': 300,
-      'gen-author': 500,
-      'geo-city-am-brazil': 1000,
-      'geo-city-am-colombia': 500,
-      'geo-city-am-chile': 200,
-      'geo-city-am-usa': 2000,
+      'geo-world-city': 80_000,
+      'mov-any-movie': 80_000,
+      'gen-tv-show': 25_000,
+      'geo-island': 10_000,
+      'geo-river': 10_000,
+      'geo-city-am-usa': 12_000,
     };
-
-    for (const [pid, minCount] of Object.entries(minCounts)) {
+    for (const [pid, minCnt] of Object.entries(minCounts)) {
       const meta = PROMPT_META_BY_ID[pid];
-      expect(meta, `Expected manifest entry for ${pid}`).toBeDefined();
-      expect(meta.answerCount).toBeGreaterThanOrEqual(minCount);
-    }
-
-    const cityChecks: Array<[string, string[]]> = [
-      ['geo-city-am-brazil', ['São Paulo', 'Rio de Janeiro']],
-      ['geo-city-am-colombia', ['Bogotá']],
-      ['geo-city-am-chile', ['Santiago']],
-    ];
-    for (const [pid, expectedNames] of cityChecks) {
-      const meta = PROMPT_META_BY_ID[pid];
-      const prompt = parsePromptJson(meta, chunks[meta.chunk][pid]);
-      const idx = buildPromptIndex(prompt);
-      for (const cityName of expectedNames) {
-        expect(matchPromptAnswer(prompt, cityName, idx).kind).not.toBe('no_echo');
-      }
+      expect(meta, `Missing mega-prompt ${pid}`).toBeDefined();
+      expect(meta.answerCount).toBeGreaterThanOrEqual(minCnt);
     }
   });
 
-  it('matches Wikidata English skos:altLabel aliases end-to-end', () => {
-    const chunks = loadAllChunksFromDisk();
+  it('accepts surnames on person prompts (formLevel 2)', async () => {
+    const composer = PROMPT_META_BY_ID['gen-composer'];
+    const footballer = PROMPT_META_BY_ID['spt-footballer'];
+    const director = PROMPT_META_BY_ID['mov-director'];
+    const scientist = PROMPT_META_BY_ID['gen-scientist'];
 
-    const islandMeta = PROMPT_META_BY_ID['geo-island'];
-    const islandPrompt = parsePromptJson(islandMeta, chunks[islandMeta.chunk][islandMeta.id]);
-    const islandIdx = buildPromptIndex(islandPrompt);
-    const boneiruMatch = matchPromptAnswer(islandPrompt, 'Boneiru', islandIdx);
-    expect(boneiruMatch.kind).toBe('alias');
-    expect(boneiruMatch.canonical).toBe('Bonaire');
+    expect(composer.formLevel).toBe(2);
+    expect(footballer.formLevel).toBe(2);
 
-    const compMeta = PROMPT_META_BY_ID['gen-compound'];
-    const compPrompt = parsePromptJson(compMeta, chunks[compMeta.chunk][compMeta.id]);
-    const compIdx = buildPromptIndex(compPrompt);
-    const aspirinAlias = matchPromptAnswer(compPrompt, 'acetylsalicylic acid', compIdx);
-    expect(aspirinAlias.kind).toBe('alias');
-    expect(aspirinAlias.canonical).toBe('aspirin');
-    const ethanolAlias = matchPromptAnswer(compPrompt, 'ethyl alcohol', compIdx);
-    expect(ethanolAlias.kind).toBe('alias');
-    expect(ethanolAlias.canonical).toBe('ethanol');
+    const mozart = await matchPromptAnswerRemote(composer, 'Mozart');
+    expect(mozart.kind).not.toBe('no_echo');
+    expect(mozart.canonical).toContain('Mozart');
 
-    const usaMeta = PROMPT_META_BY_ID['geo-city-am-usa'];
-    const usaPrompt = parsePromptJson(usaMeta, chunks[usaMeta.chunk][usaMeta.id]);
-    const usaIdx = buildPromptIndex(usaPrompt);
-    for (const nyAlias of ['NY City', 'City of New York']) {
-      const nyMatch = matchPromptAnswer(usaPrompt, nyAlias, usaIdx);
-      expect(nyMatch.kind).toBe('alias');
-      expect(nyMatch.canonical).toBe('New York City');
-    }
+    const beethoven = await matchPromptAnswerRemote(composer, 'Beethoven');
+    expect(beethoven.kind).not.toBe('no_echo');
+    expect(beethoven.canonical).toContain('Beethoven');
+
+    const messi = await matchPromptAnswerRemote(footballer, 'Messi');
+    expect(messi.kind).not.toBe('no_echo');
+    expect(messi.canonical).toBe('Lionel Messi');
+
+    const ronaldo = await matchPromptAnswerRemote(footballer, 'Ronaldo');
+    expect(ronaldo.kind).not.toBe('no_echo');
+
+    const spielberg = await matchPromptAnswerRemote(director, 'Spielberg');
+    expect(spielberg.kind).not.toBe('no_echo');
+    expect(spielberg.canonical).toBe('Steven Spielberg');
+
+    const einstein = await matchPromptAnswerRemote(scientist, 'Einstein');
+    expect(einstein.kind).not.toBe('no_echo');
+    expect(einstein.canonical).toBe('Albert Einstein');
+
+    const daVinci = await matchPromptAnswerRemote(scientist, 'da Vinci');
+    expect(daVinci.kind).not.toBe('no_echo');
+    expect(daVinci.canonical).toBe('Leonardo da Vinci');
   });
 
-  it('indexes and matches the largest enriched prompt quickly (< 200ms)', () => {
-    const chunks = loadAllChunksFromDisk();
-    const largestMeta = [...PROMPT_MANIFEST].sort(
-      (a, b) => b.answerCount - a.answerCount
-    )[0];
-    expect(largestMeta.answerCount).toBeGreaterThanOrEqual(6000);
-    const prompt = parsePromptJson(largestMeta, chunks[largestMeta.chunk][largestMeta.id]);
+  it('matches category affixes, abbreviations, Roman numerals, subtitles, and aliases', async () => {
+    const mountain = PROMPT_META_BY_ID['geo-mountain'];
+    for (const ans of ['Everest', 'Mt Everest', 'Fuji']) {
+      const res = await matchPromptAnswerRemote(mountain, ans);
+      expect(res.kind, `Expected ${ans} to match in geo-mountain`).not.toBe('no_echo');
+    }
 
+    const park = PROMPT_META_BY_ID['geo-national-park'];
+    const yellowstone = await matchPromptAnswerRemote(park, 'Yellowstone National Park');
+    expect(yellowstone.kind).not.toBe('no_echo');
+    expect(yellowstone.canonical).toBe('Yellowstone');
+
+    const lake = PROMPT_META_BY_ID['geo-lake'];
+    const victoria = await matchPromptAnswerRemote(lake, 'Victoria');
+    expect(victoria.kind).not.toBe('no_echo');
+
+    const island = PROMPT_META_BY_ID['geo-island'];
+    for (const ans of ['Bonaire', 'Boneiru', 'Bonaire Island', 'Aruba', 'Curaçao']) {
+      const res = await matchPromptAnswerRemote(island, ans);
+      expect(res.kind, `Expected ${ans} in geo-island`).not.toBe('no_echo');
+    }
+
+    const compound = PROMPT_META_BY_ID['gen-compound'];
+    const aspirin = await matchPromptAnswerRemote(compound, 'acetylsalicylic acid');
+    expect(aspirin.kind).toBe('alias');
+    expect(aspirin.canonical).toBe('aspirin');
+
+    const anyMovie = PROMPT_META_BY_ID['mov-any-movie'];
+    const rocky2 = await matchPromptAnswerRemote(anyMovie, 'Rocky 2');
+    expect(rocky2.kind).not.toBe('no_echo');
+    const toyStoryIII = await matchPromptAnswerRemote(anyMovie, 'Toy Story III');
+    expect(toyStoryIII.kind).not.toBe('no_echo');
+    const lotr = await matchPromptAnswerRemote(anyMovie, 'Fellowship of the Ring');
+    expect(lotr.kind).not.toBe('no_echo');
+  });
+
+  it('keeps wordcraft prompts strict (formLevel 0) and resolves indexed fuzzy typos quickly (< 50ms)', async () => {
+    const wrd = PROMPT_META_BY_ID['wrd-palindrome'];
+    expect(wrd.formLevel).toBe(0);
+
+    const island = PROMPT_META_BY_ID['geo-island'];
+    const bonaier = await matchPromptAnswerRemote(island, 'Bonaier', true);
+    expect(bonaier.kind).toBe('fuzzy');
+    expect(bonaier.canonical).toBe('Bonaire');
+
+    const composer = PROMPT_META_BY_ID['gen-composer'];
+    const mozrt = await matchPromptAnswerRemote(composer, 'Mozrt', true);
+    expect(mozrt.kind).toBe('fuzzy');
+    expect(mozrt.canonical).toContain('Mozart');
+
+    const mountain = PROMPT_META_BY_ID['geo-mountain'];
+    const everst = await matchPromptAnswerRemote(mountain, 'Everst', true);
+    expect(everst.kind).toBe('fuzzy');
+    expect(everst.canonical).toBe('Mount Everest');
+
+    const megaCity = PROMPT_META_BY_ID['geo-world-city'];
     const t0 = performance.now();
-    const idx = buildPromptIndex(prompt);
-    const sample = prompt.answers[prompt.answers.length - 1];
-    const exact = matchPromptAnswer(prompt, sample.canonical, idx);
-    const miss = matchPromptAnswer(prompt, 'zzzxqvkmnop', idx);
+    const hit = await matchPromptAnswerRemote(megaCity, 'Tokyo', true);
+    const miss = await matchPromptAnswerRemote(megaCity, 'zzzxqvkmnop', true);
     const elapsed = performance.now() - t0;
-
-    expect(exact.tier).toBe(sample.tier);
+    expect(hit.kind).toBe('exact');
     expect(miss.kind).toBe('no_echo');
-    expect(elapsed).toBeLessThan(200);
+    expect(elapsed).toBeLessThan(50);
+
+    const samples = await loadPromptTierSamples(megaCity, 12);
+    expect(samples.plankton.total).toBeGreaterThan(1000);
+    expect(samples.plankton.items.length).toBe(12);
+
+    const hits = await searchPromptAnswers(megaCity, 'toky', 10);
+    expect(hits.some((h) => h.canonical === 'Tokyo')).toBe(true);
   });
 
   it('maps every themed pack chapter to valid manifest prompts', () => {

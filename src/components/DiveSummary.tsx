@@ -1,15 +1,25 @@
 /**
- * Owns end-of-dive summary cards, clipboard sharing, lazy tier answer exploration, and answer search.
+ * Owns end-of-dive summary cards, clipboard sharing, SQLite tier browsing, and live answer search.
  * Does not run active round timers or persist logbook history.
  */
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { BUDDY_SPRITES, TIER_SPRITES } from '../art/pixelSprites';
 import { PixelSpriteSvg } from '../art/PixelSpriteSvg';
-import { PROMPT_META_BY_ID, getCachedPrompt, loadPrompt } from '../data';
-import { buildPromptIndex, matchPromptAnswer, normalizeAnswer } from '../domain/matcher';
+import {
+  PROMPT_META_BY_ID,
+  loadPromptTierSamples,
+  matchPromptAnswerRemote,
+  searchPromptAnswers,
+} from '../data';
 import { formatShareCard } from '../domain/scoring';
 import { ACCEPTED_TIER_ORDER, BUDDIES, TIERS, getOceanZone } from '../domain/tiers';
-import type { BuddyId, DiveRunRecord, Prompt, UserSettings } from '../domain/types';
+import type {
+  AcceptedTierId,
+  BuddyId,
+  DiveRunRecord,
+  MatchResult,
+  UserSettings,
+} from '../domain/types';
 
 interface DiveSummaryProps {
   run: DiveRunRecord;
@@ -21,7 +31,10 @@ interface DiveSummaryProps {
   onOpenWardrobe: () => void;
 }
 
+type TierSamplesMap = Record<AcceptedTierId, { total: number; items: string[] }>;
+
 const DEFAULT_TIER_PREVIEW = 12;
+const EXPANDED_TIER_PREVIEW = 120;
 
 export function DiveSummary({
   run,
@@ -34,43 +47,81 @@ export function DiveSummary({
 }: DiveSummaryProps) {
   const [copied, setCopied] = useState(false);
   const [expandedPromptId, setExpandedPromptId] = useState<string | null>(null);
-  const [loadedPrompts, setLoadedPrompts] = useState<Record<string, Prompt>>({});
+  const [tierSamples, setTierSamples] = useState<Record<string, TierSamplesMap>>({});
   const [loadingPromptId, setLoadingPromptId] = useState<string | null>(null);
   const [answerQuery, setAnswerQuery] = useState('');
+  const [queryMatch, setQueryMatch] = useState<MatchResult | null>(null);
+  const [searchHits, setSearchHits] = useState<Array<{ canonical: string; tier: AcceptedTierId }>>([]);
   const [showAllTiers, setShowAllTiers] = useState<Record<string, boolean>>({});
 
   useEffect(() => {
     if (!expandedPromptId) return;
     setAnswerQuery('');
+    setQueryMatch(null);
+    setSearchHits([]);
     setShowAllTiers({});
 
-    if (loadedPrompts[expandedPromptId]) return;
-    const cached = getCachedPrompt(expandedPromptId);
-    if (cached) {
-      setLoadedPrompts((prev) => ({ ...prev, [expandedPromptId]: cached }));
-      return;
-    }
+    if (tierSamples[expandedPromptId]) return;
+    const meta = PROMPT_META_BY_ID[expandedPromptId];
+    if (!meta) return;
 
+    let cancelled = false;
     setLoadingPromptId(expandedPromptId);
-    void loadPrompt(expandedPromptId)
-      .then((prompt) => {
-        setLoadedPrompts((prev) => ({ ...prev, [expandedPromptId]: prompt }));
+    void loadPromptTierSamples(meta, DEFAULT_TIER_PREVIEW)
+      .then((samples) => {
+        if (!cancelled) {
+          setTierSamples((prev) => ({ ...prev, [expandedPromptId]: samples }));
+        }
       })
       .finally(() => {
-        setLoadingPromptId((curr) => (curr === expandedPromptId ? null : curr));
+        if (!cancelled) {
+          setLoadingPromptId((curr) => (curr === expandedPromptId ? null : curr));
+        }
       });
-  }, [expandedPromptId, loadedPrompts]);
+    return () => {
+      cancelled = true;
+    };
+  }, [expandedPromptId, tierSamples]);
 
-  const activeExpandedPrompt = expandedPromptId ? loadedPrompts[expandedPromptId] : undefined;
-  const activePromptIndex = useMemo(
-    () => (activeExpandedPrompt ? buildPromptIndex(activeExpandedPrompt) : undefined),
-    [activeExpandedPrompt]
-  );
+  useEffect(() => {
+    const trimmed = answerQuery.trim();
+    if (!expandedPromptId || !trimmed) {
+      setQueryMatch(null);
+      setSearchHits([]);
+      return;
+    }
+    const meta = PROMPT_META_BY_ID[expandedPromptId];
+    if (!meta) return;
 
-  const queryMatch = useMemo(() => {
-    if (!activeExpandedPrompt || !answerQuery.trim()) return null;
-    return matchPromptAnswer(activeExpandedPrompt, answerQuery.trim(), activePromptIndex, true);
-  }, [activeExpandedPrompt, activePromptIndex, answerQuery]);
+    let cancelled = false;
+    const timer = window.setTimeout(() => {
+      void Promise.all([
+        matchPromptAnswerRemote(meta, trimmed, true),
+        searchPromptAnswers(meta, trimmed, 60),
+      ]).then(([matchRes, hits]) => {
+        if (!cancelled) {
+          setQueryMatch(matchRes);
+          setSearchHits(hits);
+        }
+      });
+    }, 150);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [expandedPromptId, answerQuery]);
+
+  const handleShowMoreTier = (promptId: string, tierId: AcceptedTierId) => {
+    setShowAllTiers((prev) => ({ ...prev, [tierId]: true }));
+    const meta = PROMPT_META_BY_ID[promptId];
+    const current = tierSamples[promptId];
+    if (!meta || (current && current[tierId].items.length > DEFAULT_TIER_PREVIEW)) return;
+
+    void loadPromptTierSamples(meta, EXPANDED_TIER_PREVIEW).then((expanded) => {
+      setTierSamples((prev) => ({ ...prev, [promptId]: expanded }));
+    });
+  };
 
   const zone = getOceanZone(run.totalDepth);
   const tierColor = (tier: keyof typeof TIERS) =>
@@ -172,9 +223,9 @@ export function DiveSummary({
       {run.rounds.map((round, idx) => {
         const isOpen = expandedPromptId === round.promptId;
         const meta = PROMPT_META_BY_ID[round.promptId];
-        const prompt = loadedPrompts[round.promptId];
+        const samples = tierSamples[round.promptId];
         const color = tierColor(round.tier);
-        const normQuery = normalizeAnswer(answerQuery);
+        const hasSearch = Boolean(answerQuery.trim());
 
         return (
           <div key={`${round.promptId}-${idx}`} className="pixel-box" style={{ padding: 12 }}>
@@ -226,9 +277,9 @@ export function DiveSummary({
                       fontSize: 11,
                     }}
                   >
-                    {loadingPromptId === round.promptId && !prompt ? (
-                      <div style={{ color: 'var(--text-muted)' }}>Loading answer pool...</div>
-                    ) : prompt ? (
+                    {loadingPromptId === round.promptId && !samples ? (
+                      <div style={{ color: 'var(--text-muted)' }}>Querying SQLite answer pool...</div>
+                    ) : samples ? (
                       <>
                         <input
                           type="text"
@@ -273,52 +324,55 @@ export function DiveSummary({
                           </div>
                         )}
 
-                        {[...ACCEPTED_TIER_ORDER].reverse().map((tId) => {
-                          const allInTier = prompt.answers
-                            .filter((a) => a.tier === tId)
-                            .map((a) => a.canonical);
-                          const filtered = normQuery
-                            ? allInTier.filter((c) => normalizeAnswer(c).includes(normQuery))
-                            : allInTier;
-                          if (filtered.length === 0) return null;
+                        {hasSearch && searchHits.length > 0 && (
+                          <div style={{ lineHeight: 1.5, color: 'var(--text-secondary)' }}>
+                            <span className="pixel-label" style={{ fontSize: 10, color: 'var(--cyan)', marginRight: 6 }}>
+                              MATCHING ANSWERS ({searchHits.length}):
+                            </span>
+                            {searchHits.map((h) => `${h.canonical} [${TIERS[h.tier].shortLabel}]`).join(', ')}
+                          </div>
+                        )}
 
-                          const showAll = Boolean(showAllTiers[tId]) || Boolean(normQuery);
-                          const visible = showAll
-                            ? filtered.slice(0, 120)
-                            : filtered.slice(0, DEFAULT_TIER_PREVIEW);
-                          const remaining = filtered.length - visible.length;
+                        {!hasSearch &&
+                          [...ACCEPTED_TIER_ORDER].reverse().map((tId) => {
+                            const tierData = samples[tId];
+                            if (!tierData || tierData.total === 0) return null;
 
-                          return (
-                            <div key={tId} style={{ lineHeight: 1.5 }}>
-                              <span
-                                className="pixel-label"
-                                style={{ color: tierColor(tId), fontSize: 10, marginRight: 6 }}
-                              >
-                                {TIERS[tId].shortLabel} ({TIERS[tId].points}) [{allInTier.length}]:
-                              </span>
-                              <span style={{ color: 'var(--text-secondary)' }}>
-                                {visible.join(', ')}
-                              </span>
-                              {remaining > 0 && !normQuery && (
-                                <button
-                                  type="button"
-                                  className="text-link"
-                                  style={{ marginLeft: 6, fontSize: 10 }}
-                                  onClick={() =>
-                                    setShowAllTiers((prev) => ({ ...prev, [tId]: true }))
-                                  }
+                            const showAll = Boolean(showAllTiers[tId]);
+                            const visible = showAll
+                              ? tierData.items.slice(0, EXPANDED_TIER_PREVIEW)
+                              : tierData.items.slice(0, DEFAULT_TIER_PREVIEW);
+                            const remaining = tierData.total - visible.length;
+
+                            return (
+                              <div key={tId} style={{ lineHeight: 1.5 }}>
+                                <span
+                                  className="pixel-label"
+                                  style={{ color: tierColor(tId), fontSize: 10, marginRight: 6 }}
                                 >
-                                  Show more ({remaining} more)
-                                </button>
-                              )}
-                              {normQuery && filtered.length > 120 && (
-                                <span style={{ color: 'var(--text-muted)', marginLeft: 6 }}>
-                                  (+{filtered.length - 120} more matches)
+                                  {TIERS[tId].shortLabel} ({TIERS[tId].points}) [{tierData.total.toLocaleString()}]:
                                 </span>
-                              )}
-                            </div>
-                          );
-                        })}
+                                <span style={{ color: 'var(--text-secondary)' }}>
+                                  {visible.join(', ')}
+                                </span>
+                                {remaining > 0 && !showAll && (
+                                  <button
+                                    type="button"
+                                    className="text-link"
+                                    style={{ marginLeft: 6, fontSize: 10 }}
+                                    onClick={() => handleShowMoreTier(round.promptId, tId)}
+                                  >
+                                    Show more ({remaining.toLocaleString()} more)
+                                  </button>
+                                )}
+                                {showAll && remaining > 0 && (
+                                  <span style={{ color: 'var(--text-muted)', marginLeft: 6 }}>
+                                    (+{remaining.toLocaleString()} more - use search box above)
+                                  </span>
+                                )}
+                              </div>
+                            );
+                          })}
                       </>
                     ) : null}
                   </div>

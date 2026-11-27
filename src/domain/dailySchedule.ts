@@ -7,6 +7,7 @@ export const DAILY_PROMPT_COUNT = 7;
 export interface SchedulePromptItem {
   id: string;
   category: PromptCategory;
+  packOnly?: boolean;
 }
 
 export function getEasternDateString(now: Date = new Date()): string {
@@ -103,9 +104,10 @@ const deckCache = new Map<string, SchedulePromptItem[]>();
  * before any prompt repeats, while balancing categories across each 7-prompt day.
  */
 function getCycleDeck<T extends SchedulePromptItem>(catalog: T[], cycleSeed = 20260716): T[] {
-  const firstId = catalog[0]?.id ?? '';
-  const lastId = catalog[catalog.length - 1]?.id ?? '';
-  const cacheKey = `${catalog.length}:${firstId}:${lastId}:${cycleSeed}`;
+  const eligible = catalog.filter((item) => !item.packOnly);
+  const firstId = eligible[0]?.id ?? '';
+  const lastId = eligible[eligible.length - 1]?.id ?? '';
+  const cacheKey = `${eligible.length}:${firstId}:${lastId}:${cycleSeed}`;
   const cached = deckCache.get(cacheKey);
   if (cached) return cached as T[];
 
@@ -114,7 +116,7 @@ function getCycleDeck<T extends SchedulePromptItem>(catalog: T[], cycleSeed = 20
   for (const cat of CATEGORIES) {
     buckets.set(cat, []);
   }
-  for (const item of catalog) {
+  for (const item of eligible) {
     const list = buckets.get(item.category);
     if (list) list.push(item);
     else buckets.set(item.category, [item]);
@@ -123,7 +125,7 @@ function getCycleDeck<T extends SchedulePromptItem>(catalog: T[], cycleSeed = 20
     shuffleInPlace(list, rng);
   }
 
-  const totalDays = Math.floor(catalog.length / DAILY_PROMPT_COUNT);
+  const totalDays = Math.floor(eligible.length / DAILY_PROMPT_COUNT);
   const deck: T[] = [];
   const cursors = new Map<PromptCategory, number>();
   for (const cat of CATEGORIES) cursors.set(cat, 0);
@@ -142,12 +144,15 @@ function getCycleDeck<T extends SchedulePromptItem>(catalog: T[], cycleSeed = 20
   for (let day = 0; day < totalDays; day++) {
     const dayItems: T[] = [];
     const dayCounts = new Map<PromptCategory, number>();
+    const daysLeft = Math.max(1, totalDays - day);
 
-    // First pass: pick one from distinct available categories proportional to remaining pool
+    // Spread smaller pools smoothly across the full year via proportional sampling
     const shuffledCats = shuffleInPlace([...CATEGORIES], rng);
     for (const cat of shuffledCats) {
       if (dayItems.length >= DAILY_PROMPT_COUNT) break;
-      if (remainingFor(cat) > 0) {
+      const rem = remainingFor(cat);
+      if (rem <= 0) continue;
+      if (rem >= daysLeft || rng() < rem / daysLeft) {
         const picked = takeOne(cat);
         if (picked) {
           dayItems.push(picked);
@@ -156,16 +161,16 @@ function getCycleDeck<T extends SchedulePromptItem>(catalog: T[], cycleSeed = 20
       }
     }
 
-    // Second pass: fill remaining slots favoring largest remaining pools (keeping variety)
+    // Fill remaining slots maximizing remaining ratio while avoiding >2 from one category when possible
     while (dayItems.length < DAILY_PROMPT_COUNT) {
       const candidates = CATEGORIES.filter((c) => remainingFor(c) > 0).sort((a, b) => {
-        const remRatioA = remainingFor(a) / Math.max(1, buckets.get(a)?.length ?? 1);
-        const remRatioB = remainingFor(b) / Math.max(1, buckets.get(b)?.length ?? 1);
         const countA = dayCounts.get(a) ?? 0;
         const countB = dayCounts.get(b) ?? 0;
         if (countA !== countB && (countA < 2 || countB < 2)) {
           return countA - countB;
         }
+        const remRatioA = remainingFor(a) / Math.max(1, buckets.get(a)?.length ?? 1);
+        const remRatioB = remainingFor(b) / Math.max(1, buckets.get(b)?.length ?? 1);
         return remRatioB - remRatioA;
       });
       if (candidates.length === 0) break;
@@ -188,11 +193,12 @@ export function getPromptsForDiveNumber<T extends SchedulePromptItem>(
   catalog: T[],
   diveNumber: number
 ): T[] {
-  const cycleDays = Math.floor(catalog.length / DAILY_PROMPT_COUNT);
+  const eligible = catalog.filter((item) => !item.packOnly);
+  const cycleDays = Math.floor(eligible.length / DAILY_PROMPT_COUNT);
   if (cycleDays < 1) {
-    return catalog.slice(0, DAILY_PROMPT_COUNT);
+    return eligible.slice(0, DAILY_PROMPT_COUNT);
   }
-  const deck = getCycleDeck(catalog);
+  const deck = getCycleDeck(eligible);
   const dayIndex = (Math.max(1, diveNumber) - 1) % cycleDays;
   const start = dayIndex * DAILY_PROMPT_COUNT;
   return deck.slice(start, start + DAILY_PROMPT_COUNT);
@@ -203,11 +209,12 @@ export function pickUnlimitedPrompts<T extends SchedulePromptItem>(
   recentPromptIds: string[] = [],
   count = DAILY_PROMPT_COUNT
 ): T[] {
+  const eligible = catalog.filter((item) => !item.packOnly);
   const exclude = new Set(recentPromptIds);
   const seed = Math.floor(Math.random() * 2_000_000_000) ^ Date.now();
   const rng = mulberry32(seed);
-  const pool = catalog.filter((p) => !exclude.has(p.id));
-  const source = pool.length >= count ? [...pool] : [...catalog];
+  const pool = eligible.filter((p) => !exclude.has(p.id));
+  const source = pool.length >= count ? [...pool] : [...eligible];
   shuffleInPlace(source, rng);
 
   const chosen: T[] = [];

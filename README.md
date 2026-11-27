@@ -1,25 +1,31 @@
 # Krillion - Static Edition for GitLab Pages
 
-A 100% static, zero-backend single-player version of **Krillion ("The Daily Dive")** built with Vite, React, TypeScript, and HTML5 Canvas, ready to deploy on **GitLab Static Pages**.
+A 100% static, zero-backend single-player version of **Krillion ("The Daily Dive")** built with Vite, React, TypeScript, HTML5 Canvas, and **Static SQLite over HTTP (`sql.js-httpvfs`)**, ready to deploy from a **single GitLab repository** on **GitLab Static Pages**.
 
 ## Included Features
 
-- **Daily Dive**: 7 prompts per day, 25 seconds per prompt, resetting at midnight Eastern Time (`America/New_York`). Uses a deterministic permutation cycle across **4,127 prompts** (**589 consecutive days** with zero repeated prompts), **1,131,554 answers**, and **473,690 Wikidata English aliases**.
-- **6 Rarity Tiers & Depth Scoring**: `Plankton` (5 pts / 50m), `Too Clever` (15 pts / 150m), `Schooler` (30 pts / 300m), `Rare` (60 pts / 600m), `Deep Cut` (85 pts / 850m), and `One in a Krillion` (100 pts / 1,000m), up to 7,000m in the Hadal Zone.
+- **Full-Year Broad Trivia Catalog (Zero Repeats for 403 Days)**:
+  - **2,822 daily-eligible broad trivia prompts** (**403 consecutive days** with zero repeated prompts in Daily Dive and Unlimited), with no robotic `"word starting with X"` or `"N-letter word"` clutter (`2,830` total prompts including 8 themed-pack rounds).
+  - **2,186,936 answer links** across **739,914 entities** and **1,975,539 searchable forms**, including mega-pools up to **100,000 answers** (`geo-world-city`, `mov-any-movie`), **40,000** (`gen-tv-show`), and **10,000-15,000+** (`geo-river`, `gen-composer`, `geo-mountain`, `geo-island`, `mov-director`, `spt-footballer`).
+- **Static SQLite over HTTP (Single-Repo Architecture)**:
+  - Compiled into a **184.91 MiB** indexed SQLite database split into **19 static 10 MiB chunks** under `public/data/db/krillion.sqlite3.000` through `krillion.sqlite3.018` (with `sqlite.worker.js`, `sql-wasm.wasm`, and `config.json`).
+  - The browser never downloads the full database: `sql.js-httpvfs` issues standard HTTP `Range` requests for tiny 4 KB B-tree pages per guess (<50 ms lookup even on 100,000-answer prompts).
+- **Human-Friendly Matching (Fewer `NO ECHO` Rejections)**:
+  - **Surnames on person prompts**: `Mozart`, `Beethoven`, `Messi`, `Spielberg`, `Einstein`, `da Vinci`.
+  - **Optional category prefixes/suffixes & abbreviations**: `Everest` / `Mt Everest` for `Mount Everest`, `Yellowstone National Park` for `Yellowstone`, `Victoria` for `Lake Victoria`, `St Lucia` for `Saint Lucia`.
+  - **Roman numerals & subtitles**: `Rocky 2` matches `Rocky II`, `Toy Story III` matches `Toy Story 3`, `Fellowship of the Ring` matches full titles.
+  - **Wikidata / GeoNames / IMDb aliases & indexed fuzzy typos**: `Boneiru` -> `Bonaire`, `acetylsalicylic acid` -> `aspirin`, `Bonaier` -> `Bonaire`, `Everst` -> `Mount Everest`.
 - **All Single-Player Modes Free & Unlocked**:
-  - **Archive** (`#/archive`): Replay past Daily Dives from `#1` up to yesterday.
-  - **Themed Packs** (`#/packs`): 4 themed packs (Words & Language, At the Movies, Sports, Geography), 5 chapters each.
-  - **Unlimited** (`#/unlimited`): Endless 7-prompt dives across the full catalog.
-  - **Wardrobe & Streaks**: 9 pixel-art Dive Buddies unlocked by daily streaks, saved in `localStorage`.
-  - **My Krillion Logbook** (`#/account`) & **Settings**: Low-power mode, Colorblind mode, Answer corrections (fuzzy typo preview), Clear rejected entries, Sound toggle (Web Audio retro synth), and Share link toggle.
+  - **Daily Dive**, **Archive** (`#/archive`), **Themed Packs** (`#/packs`), **Unlimited** (`#/unlimited`), **Wardrobe & Streaks** (9 pixel-art Dive Buddies in `localStorage`), **My Krillion Logbook** (`#/account`), **Live Depth Plunge Animation**, and **Settings**.
 
 ---
 
-## Deploying to GitLab Static Pages
+## Deploying to GitLab Static Pages (Single Repository)
 
-This project is preconfigured for GitLab Pages:
-- `.gitlab-ci.yml` defines the `pages` job (`npm ci` -> `npm run test` -> `npm run build` -> copies `dist/` to `public/`).
-- `vite.config.ts` sets `base: './'` and `src/App.tsx` uses hash routing (`#/...`), so the game works on both **project subpaths** (`https://<username>.gitlab.io/<repo>/`) and **custom domains** without extra configuration.
+This project is preconfigured for a **single GitLab repository**:
+- `.gitlab-ci.yml` uses `image: node:24-alpine` and defines the `pages` job (`npm ci` -> `npm run test` -> `npm run build` -> copies `dist/` to `public/`).
+- Every database chunk in `public/data/db/` is <= 10 MiB (well under Git/GitLab file limits), and Vite copies `public/data/db/` directly into `dist/data/db/`.
+- `vite.config.ts` sets `base: './'` and `src/App.tsx` uses hash routing (`#/...`), so relative HTTP `Range` requests for `./data/db/krillion.sqlite3.*` work on both **project subpaths** (`https://<username>.gitlab.io/<repo>/`) and **custom domains**.
 
 ### Option A: Push via Git CLI (Recommended)
 
@@ -40,37 +46,39 @@ This project is preconfigured for GitLab Pages:
    *(If your GitLab project's default branch is named `master`, use `-b master` and `git push -u origin master` instead - `.gitlab-ci.yml` automatically watches `$CI_DEFAULT_BRANCH`.)*
 3. **Wait for the CI pipeline to finish**:
    - In GitLab, open **Build -> Pipelines** and wait for the `pages` job to pass (green checkmark).
-   - Note: GitLab.com shared runners must be enabled on the project (enabled by default under **Settings -> CI/CD -> Runners**).
+   - GitLab.com shared runners must be enabled on the project (enabled by default under **Settings -> CI/CD -> Runners**).
 4. **Open your live game**:
-   - Go to **Deploy -> Pages** in your GitLab project sidebar.
-   - Click the listed Pages URL (typically `https://<your-username>.gitlab.io/<your-repo>/`, or the unique domain URL if **Use unique domain** is checked in Pages settings - either works).
-   - Optional: Under **Deploy -> Pages**, uncheck **Use unique domain** if you prefer the cleaner `https://<username>.gitlab.io/<repo>/` URL, or click **New Domain** to attach a custom domain.
+   - Go to **Deploy -> Pages** in your GitLab project sidebar and click your Pages URL.
 
 ### Option B: Upload Files in the GitLab Web UI (No Git CLI)
 
 1. Create a blank GitLab project.
-2. Unzip `krillion-gitlab-project.zip` locally and upload all files (including hidden files `.gitlab-ci.yml` and `.gitignore`) to the default branch, or use GitLab's Web IDE to import the folder.
+2. Unzip `krillion-gitlab-project.zip` locally and upload all files (including `.gitlab-ci.yml`, `.gitignore`, and `public/data/db/`) to the default branch.
 3. Commit to the default branch; GitLab CI will run `.gitlab-ci.yml` and publish to **Deploy -> Pages**.
 
 ---
 
 ## Local Development & Commands
 
-Requires Node.js 20+ (tested on Node 24):
+Requires Node.js 24+ (for built-in `node:sqlite` in tests):
 
 ```bash
 npm install      # Install dependencies
 npm run dev      # Start local dev server (http://localhost:5173/)
-npm run test     # Run Vitest unit & chunk-integrity tests
+npm run test     # Run Vitest unit & chunked SQLite integrity tests
 npm run build    # Type-check and build production bundle into dist/
 npm run preview  # Preview the production build locally
 ```
 
-## Updating or Expanding the Prompt Database
+## Updating or Rebuilding the SQLite Database
 
-All 4,127 prompts, 1,131,554 answers, and 473,690 aliases are stored as 256 static JSON chunks under `public/data/chunks/chunk-000.json` through `chunk-255.json`, indexed by `src/data/manifest.ts`.
+The database is generated by `scripts/build_sqlite_database.py` (Python 3) from:
+- Curated seeds (`scripts/seed_prompts.json`)
+- Bulk GeoNames (`cities500.zip`, `countryInfo.txt`, `admin1CodesASCII.txt`) and IMDb (`title.basics.tsv.gz`, `title.ratings.tsv.gz`) dumps
+- Sitelink-banded batched Wikidata SPARQL queries + English `skos:altLabel` aliases
 
-To regenerate or customize the dataset (requires Python 3):
-- Edit `scripts/seed_prompts.json` or `scripts/build_year_database.py`.
-- Run `python3 scripts/build_year_database.py` to rebuild `public/data/chunks/` and `src/data/manifest.ts`.
-- Run `npm run test && npm run build` before committing and pushing to GitLab.
+To rebuild `public/data/db/` and `src/data/manifest.ts`:
+```bash
+python3 -u scripts/build_sqlite_database.py
+npm run test && npm run build
+```

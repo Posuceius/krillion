@@ -9,7 +9,15 @@ import {
   getDiveNumberForDate,
   getPromptsForDiveNumber,
 } from './dailySchedule';
-import { buildPromptIndex, matchPromptAnswer, normalizeAnswer } from './matcher';
+import {
+  buildPromptIndex,
+  expandAbbreviations,
+  generateQueryCandidates,
+  matchPromptAnswer,
+  normalizeAnswer,
+  normalizeRomanNumerals,
+  stripCategoryAffixes,
+} from './matcher';
 import { formatShareCard, recordCompletedRun } from './scoring';
 import { TIERS, getOceanZone } from './tiers';
 import type { DiveRunRecord, LogbookState, Prompt } from './types';
@@ -58,6 +66,17 @@ describe('matcher', () => {
     expect(autoAccept.needsConfirmation).toBe(false);
   });
 
+  it('normalizes Roman numerals, abbreviations, and category affixes', () => {
+    expect(normalizeRomanNumerals('rocky ii')).toBe('rocky 2');
+    expect(normalizeRomanNumerals('toy story iii')).toBe('toy story 3');
+    expect(expandAbbreviations('mt everest')).toBe('mount everest');
+    expect(expandAbbreviations('st lucia')).toBe('saint lucia');
+    expect(stripCategoryAffixes('mount everest')).toContain('everest');
+    expect(stripCategoryAffixes('yellowstone national park')).toContain('yellowstone');
+    expect(generateQueryCandidates('Yellowstone National Park', 1)).toContain('yellowstone');
+    expect(generateQueryCandidates('starting q', 0)).toEqual(['starting q']);
+  });
+
   it('rejects unrelated gibberish as no_echo', () => {
     const idx = buildPromptIndex(samplePrompt);
     const miss = matchPromptAnswer(samplePrompt, 'asdfqwerty', idx, true);
@@ -72,6 +91,20 @@ describe('dailySchedule', () => {
     expect(getDiveNumberForDate('2026-11-26')).toBe(134);
     expect(dateStringFromDiveNumber(134)).toBe('2026-11-26');
     expect(getDiveNumberForDate('2026-07-16')).toBe(1);
+  });
+
+  it('excludes packOnly prompts from daily dives', () => {
+    const mockCatalog = [
+      { id: 'pack-q', category: 'words' as const, packOnly: true },
+      ...Array.from({ length: 14 }, (_, i) => ({
+        id: `broad-${i}`,
+        category: 'general' as const,
+      })),
+    ];
+    for (let d = 1; d <= 2; d++) {
+      const picks = getPromptsForDiveNumber(mockCatalog, d);
+      expect(picks.some((p) => p.id === 'pack-q')).toBe(false);
+    }
   });
 
   it('selects 7 distinct prompts deterministically without repeating across a full 365-day year', () => {
