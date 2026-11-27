@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """
-Build a 3,600+ prompt Krillion database (500+ consecutive non-repeating days)
+Build the expanded Krillion v1.2.0 database (500+ consecutive non-repeating days)
 from:
-  1. All 159 core curated & Wikidata-enriched prompts (with island/archipelago & movie fixes)
-  2. Letter-slices of large core & master Wikidata pools
-  3. Fast cached master Wikidata SPARQL datasets (TV, anime, manga, songs, video games,
-     movies by genre/decade/country, Americas/world cities, rivers, sports, science, nature,
-     history, companies, foods)
-  4. Rich English wordcraft prompts derived from /usr/share/dict/ + Norvig 333k word frequencies
+  1. All 159 core curated & Wikidata-enriched prompts (deepened up to 8,000 answers)
+  2. Fixed & broadened Wikidata master SPARQL datasets (TV, anime, manga, songs,
+     video games + genres, movies by decade/genre/country, Americas/world cities with
+     broadened P31 classes, rivers, mountains, sports, science, nature, history, foods)
+  3. Batched Wikidata English skos:altLabel aliases merged cleanly across entries
+  4. Letter-slices of large core & master Wikidata pools
+  5. Rich English wordcraft prompts derived from /usr/share/dict/ + Norvig 333k frequencies
 
 Outputs:
-  - public/data/chunks/chunk-000.json .. chunk-127.json (128 deterministic chunks)
+  - public/data/chunks/chunk-000.json .. chunk-255.json (256 deterministic chunks)
   - src/data/manifest.ts (PROMPT_MANIFEST, TOTAL_ANSWER_COUNT, YEAR_COVERAGE_DAYS, THEMED_PACKS)
 """
 
@@ -23,6 +24,7 @@ import re
 import shutil
 import time
 import unicodedata
+import urllib.error
 import urllib.parse
 import urllib.request
 from collections import Counter, defaultdict
@@ -32,20 +34,22 @@ from typing import Any
 ROOT = Path(__file__).resolve().parent.parent
 SEED_PATH = ROOT / "scripts" / "seed_prompts.json"
 CACHE_DIR = ROOT / "scripts" / ".cache"
-MASTER_CACHE = CACHE_DIR / "master"
+MASTER_CACHE = CACHE_DIR / "master_v2"
+ALIASES_CACHE_PATH = CACHE_DIR / "aliases_en.json"
 ENRICHED_159_DIR = CACHE_DIR / "enriched_159"
 WORD_FREQ_PATH = CACHE_DIR / "word_freq.txt"
 OLD_PROMPTS_DIR = ROOT / "public" / "data" / "prompts"
 OUT_CHUNKS_DIR = ROOT / "public" / "data" / "chunks"
 OUT_MANIFEST_PATH = ROOT / "src" / "data" / "manifest.ts"
 
-NUM_CHUNKS = 128
+NUM_CHUNKS = 256
 TIERS = ["plankton", "tooclever", "schooler", "rare", "deepcut", "krillion"]
 SPARQL_ENDPOINT = "https://query.wikidata.org/sparql"
-USER_AGENT = "KrillionStaticBuilder/1.2 (https://gitlab.com; static-pages-game)"
+USER_AGENT = "KrillionStaticBuilder/1.3 (https://gitlab.com; static-pages-game)"
 MIN_ANSWERS = 30
-MAX_FACET_ANSWERS = 1200
-MAX_SEED_ANSWERS = 3500
+MAX_FACET_ANSWERS = 2500
+MAX_SEED_ANSWERS = 8000
+MAX_ALIASES_PER_ENTRY = 6
 
 
 # Comprehensive curated island & island territory additions (ensuring Bonaire, Aruba,
@@ -244,7 +248,7 @@ def clean_label(label: str) -> tuple[str, list[str]] | None:
     lower = label.lower()
     if lower.startswith(("list of ", "category:", "template:", "wikipedia:", "portal:")):
         return None
-    if len(label) > 50 or not re.search(r"[a-zA-Z]", label):
+    if len(label) > 52 or not re.search(r"[a-zA-Z]", label):
         return None
     aliases: list[str] = []
     m = re.match(r"^(.+?)\s*\([^)]{2,28}\)$", label)
@@ -256,6 +260,54 @@ def clean_label(label: str) -> tuple[str, list[str]] | None:
     return label, aliases
 
 
+def clean_wikidata_aliases(
+    canonical: str,
+    raw_aliases: list[str],
+    max_aliases: int = MAX_ALIASES_PER_ENTRY,
+) -> list[str]:
+    cnorm = normalize_answer(canonical)
+    if not cnorm:
+        return []
+    canon_vars = set(plural_variants(cnorm))
+    seen_norms: set[str] = set(canon_vars)
+    accepted: list[str] = []
+
+    def is_valid_alias(al: str) -> bool:
+        al = al.strip()
+        if len(al) < 2 or len(al) > 38:
+            return False
+        if any(ch in al for ch in (",", "(", ")", "[", "]", "{", "}", '"', "\n", "\r")):
+            return False
+        if "http://" in al or "https://" in al:
+            return False
+        if not re.search(r"[a-zA-Z]", al):
+            return False
+        lower = al.lower()
+        if lower.startswith(("list of ", "category:", "template:", "wikipedia:", "portal:", "file:")):
+            return False
+        return True
+
+    cleaned_candidates: list[str] = []
+    for raw in raw_aliases:
+        s = raw.strip()
+        if is_valid_alias(s):
+            cleaned_candidates.append(s)
+
+    cleaned_candidates.sort(key=lambda s: (len(s) > 22, len(s), s.lower(), s))
+    for al in cleaned_candidates:
+        anorm = normalize_answer(al)
+        if not anorm:
+            continue
+        avars = plural_variants(anorm)
+        if any(v in seen_norms for v in avars):
+            continue
+        seen_norms.update(avars)
+        accepted.append(al)
+        if len(accepted) >= max_aliases:
+            break
+    return accepted
+
+
 def first_alpha_letter(s: str) -> str | None:
     s = strip_article(normalize_answer(s))
     if not s:
@@ -264,7 +316,26 @@ def first_alpha_letter(s: str) -> str | None:
     return ch.upper() if "a" <= ch <= "z" else None
 
 
-def run_sparql_rows(name: str, query: str) -> list[dict[str, str]]:
+def post_sparql(query: str, timeout: int = 25) -> dict[str, Any]:
+    body = urllib.parse.urlencode({"query": query}).encode("utf-8")
+    req = urllib.request.Request(
+        SPARQL_ENDPOINT,
+        data=body,
+        headers={
+            "Accept": "application/sparql-results+json",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "User-Agent": USER_AGENT,
+        },
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def run_sparql_rows(
+    name: str,
+    query: str,
+    fallback_query: str | None = None,
+) -> list[dict[str, str]]:
     MASTER_CACHE.mkdir(parents=True, exist_ok=True)
     cache_file = MASTER_CACHE / f"{name}.json"
     if cache_file.exists():
@@ -272,43 +343,170 @@ def run_sparql_rows(name: str, query: str) -> list[dict[str, str]]:
         if len(data) > 0:
             return data
 
-    url = f"{SPARQL_ENDPOINT}?{urllib.parse.urlencode({'query': query})}"
-    req = urllib.request.Request(
-        url,
-        headers={
-            "Accept": "application/sparql-results+json",
-            "User-Agent": USER_AGENT,
-        },
-    )
+    queries_to_try = [query] + ([fallback_query] if fallback_query else [])
+    for q_idx, active_query in enumerate(queries_to_try):
+        for attempt, delay in enumerate([0.45, 1.5, 3.0]):
+            try:
+                time.sleep(delay)
+                payload = post_sparql(active_query, timeout=25)
+                rows: list[dict[str, str]] = []
+                for b in payload.get("results", {}).get("bindings", []):
+                    row = {k: v.get("value", "") for k, v in b.items()}
+                    lbl = row.get("itemLabel", "")
+                    if not lbl or re.match(r"^Q\d+$", lbl):
+                        continue
+                    item_uri = row.pop("item", "")
+                    if item_uri:
+                        qid = item_uri.rsplit("/", 1)[-1]
+                        if re.match(r"^Q\d+$", qid):
+                            row["qid"] = qid
+                    rows.append(row)
+                if rows:
+                    cache_file.write_text(json.dumps(rows), encoding="utf-8")
+                suffix = " (fallback)" if q_idx > 0 else ""
+                print(f"  [SPARQL] {name}{suffix}: {len(rows)} rows")
+                return rows
+            except urllib.error.HTTPError as exc:
+                print(f"  [SPARQL retry {attempt + 1}] {name}: HTTP {exc.code}")
+                if exc.code == 429:
+                    time.sleep(4.0 * (attempt + 1))
+            except Exception as exc:
+                print(f"  [SPARQL retry {attempt + 1}] {name}: {exc}")
 
-    for attempt in range(2):
-        try:
-            time.sleep(0.5 * (attempt + 1))
-            with urllib.request.urlopen(req, timeout=14) as resp:
-                payload = json.loads(resp.read().decode("utf-8"))
-            rows: list[dict[str, str]] = []
-            for b in payload.get("results", {}).get("bindings", []):
-                row = {k: v.get("value", "") for k, v in b.items()}
-                lbl = row.get("itemLabel", "")
-                if not lbl or re.match(r"^Q\d+$", lbl):
-                    continue
-                rows.append(row)
-            if rows:
-                cache_file.write_text(json.dumps(rows), encoding="utf-8")
-            print(f"  [SPARQL] {name}: {len(rows)} rows")
-            return rows
-        except Exception as exc:
-            print(f"  [SPARQL retry {attempt+1}] {name}: {exc}")
-            time.sleep(1.2 * (attempt + 1))
+    v1_cache = CACHE_DIR / "master" / f"{name}.json"
+    if v1_cache.exists():
+        v1_data = json.loads(v1_cache.read_text("utf-8"))
+        if len(v1_data) > 0:
+            print(f"  [SPARQL fallback v1 cache] {name}: {len(v1_data)} rows")
+            return v1_data
 
     return []
+
+
+def dedup_rows_by_qid(
+    rows: list[dict[str, str]],
+    keep_min_year: bool = False,
+) -> list[dict[str, str]]:
+    by_qid: dict[str, dict[str, str]] = {}
+    passthrough: list[dict[str, str]] = []
+
+    for row in rows:
+        qid = row.get("qid")
+        if not qid:
+            passthrough.append(row)
+            continue
+        prev = by_qid.get(qid)
+        if prev is None:
+            by_qid[qid] = dict(row)
+            continue
+        prev_sl = float(prev.get("sitelinks", 1) or 1)
+        cur_sl = float(row.get("sitelinks", 1) or 1)
+        if cur_sl > prev_sl:
+            prev["sitelinks"] = row.get("sitelinks", prev.get("sitelinks", "1"))
+        if keep_min_year and row.get("year"):
+            cur_year = row["year"]
+            prev_year = prev.get("year", "")
+            if not prev_year or (cur_year.isdigit() and prev_year.isdigit() and int(cur_year) < int(prev_year)):
+                prev["year"] = cur_year
+
+    return list(by_qid.values()) + passthrough
+
+
+def fetch_wikidata_aliases(qids: set[str]) -> dict[str, list[str]]:
+    ALIASES_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    alias_cache: dict[str, list[str]] = {}
+    if ALIASES_CACHE_PATH.exists():
+        alias_cache = json.loads(ALIASES_CACHE_PATH.read_text("utf-8"))
+
+    missing = sorted(q for q in qids if q and q not in alias_cache)
+    if not missing:
+        print(f"  [Aliases] Loaded {len(alias_cache):,} QIDs from cache (0 missing).")
+        return alias_cache
+
+    batch_size = 400
+    total_batches = (len(missing) + batch_size - 1) // batch_size
+    print(f"  [Aliases] Fetching English skos:altLabel for {len(missing):,} QIDs in {total_batches} batches...")
+
+    for b_idx in range(total_batches):
+        batch = missing[b_idx * batch_size : (b_idx + 1) * batch_size]
+        vals = " ".join(f"wd:{q}" for q in batch)
+        q = f"""
+SELECT ?item ?alt WHERE {{
+  VALUES ?item {{ {vals} }}
+  ?item skos:altLabel ?alt .
+  FILTER(LANG(?alt) = "en")
+}}"""
+        fetched: dict[str, list[str]] = {qid: [] for qid in batch}
+        ok = False
+        for attempt, delay in enumerate([0.45, 2.0, 5.0]):
+            try:
+                time.sleep(delay)
+                payload = post_sparql(q, timeout=25)
+                for b in payload.get("results", {}).get("bindings", []):
+                    item_uri = b.get("item", {}).get("value", "")
+                    alt_val = b.get("alt", {}).get("value", "").strip()
+                    qid = item_uri.rsplit("/", 1)[-1]
+                    if qid in fetched and alt_val:
+                        fetched[qid].append(alt_val)
+                ok = True
+                break
+            except urllib.error.HTTPError as exc:
+                print(f"  [Aliases batch {b_idx + 1}/{total_batches} retry {attempt + 1}] HTTP {exc.code}")
+                if exc.code == 429:
+                    time.sleep(6.0 * (attempt + 1))
+            except Exception as exc:
+                print(f"  [Aliases batch {b_idx + 1}/{total_batches} retry {attempt + 1}] {exc}")
+
+        if ok:
+            for qid, als in fetched.items():
+                alias_cache[qid] = list(dict.fromkeys(als))
+
+        if (b_idx + 1) % 15 == 0 or (b_idx + 1) == total_batches:
+            ALIASES_CACHE_PATH.write_text(json.dumps(alias_cache, separators=(",", ":")), encoding="utf-8")
+            print(f"  [Aliases] Progress: batch {b_idx + 1}/{total_batches} ({len(alias_cache):,} QIDs cached)")
+
+    return alias_cache
+
+
+def rows_to_scored_items(
+    rows: list[dict[str, str]],
+    alias_map: dict[str, list[str]],
+) -> list[tuple[str, float, list[str]]]:
+    items: list[tuple[str, float, list[str]]] = []
+    for r in rows:
+        cleaned = clean_label(r["itemLabel"])
+        if not cleaned:
+            continue
+        canon, base_aliases = cleaned
+        sl = float(r.get("sitelinks", 1) or 1)
+        qid = r.get("qid", "")
+        raw_als = list(base_aliases)
+        if qid and qid in alias_map:
+            raw_als.extend(alias_map[qid])
+        valid_als = clean_wikidata_aliases(canon, raw_als)
+        items.append((canon, sl, valid_als))
+    return items
 
 
 def build_balanced_tiers(
     scored_items: list[tuple[str, float, list[str]]],
     max_answers: int = MAX_FACET_ANSWERS,
 ) -> dict[str, list[Any]] | None:
-    ordered = sorted(scored_items, key=lambda x: x[1], reverse=True)
+    coalesced: dict[str, tuple[str, float, list[str]]] = {}
+    for canon, sc, aliases in scored_items:
+        cnorm = normalize_answer(canon)
+        if not cnorm:
+            continue
+        if cnorm not in coalesced:
+            coalesced[cnorm] = (canon, sc, list(aliases))
+        else:
+            prev_canon, prev_sc, prev_aliases = coalesced[cnorm]
+            best_canon = canon if sc > prev_sc else prev_canon
+            best_sc = sc if sc > prev_sc else prev_sc
+            merged_als = list(dict.fromkeys([*prev_aliases, *aliases]))
+            coalesced[cnorm] = (best_canon, best_sc, merged_als)
+
+    ordered = sorted(coalesced.values(), key=lambda x: x[1], reverse=True)
     seen_norms: set[str] = set()
     unique: list[tuple[str, float, list[str]]] = []
 
@@ -321,7 +519,8 @@ def build_balanced_tiers(
             continue
         valid_aliases: list[str] = []
         new_vars = list(pvars)
-        for al in aliases:
+        cleaned_als = clean_wikidata_aliases(canon, aliases)
+        for al in cleaned_als:
             anorm = normalize_answer(al)
             if not anorm:
                 continue
@@ -330,8 +529,7 @@ def build_balanced_tiers(
                 continue
             valid_aliases.append(al)
             new_vars.extend(avars)
-        for v in new_vars:
-            seen_norms.add(v)
+        seen_norms.update(new_vars)
         unique.append((canon, sc, valid_aliases))
         if len(unique) >= max_answers:
             break
@@ -382,7 +580,7 @@ def merge_additional_into_tiers(
     additions: list[tuple[str, float, list[str]]],
     max_total: int = MAX_SEED_ANSWERS,
 ) -> dict[str, list[Any]]:
-    """Preserve base seed/enriched items at their tiers, and append new verified items."""
+    """Preserve base seed/enriched items at their tiers, and append new verified items + aliases."""
     tier_weight = {
         "plankton": 140.0,
         "tooclever": 80.0,
@@ -440,7 +638,12 @@ class PromptRegistry:
         self.seen_texts.add(tkey)
         return True
 
-    def upgrade(self, pid: str, additions: list[tuple[str, float, list[str]]], max_total: int = MAX_SEED_ANSWERS) -> None:
+    def upgrade(
+        self,
+        pid: str,
+        additions: list[tuple[str, float, list[str]]],
+        max_total: int = MAX_SEED_ANSWERS,
+    ) -> None:
         existing = self.by_id.get(pid)
         if not existing or not additions:
             return
@@ -478,28 +681,416 @@ def load_seed_and_existing(reg: PromptRegistry) -> None:
         reg.add(pid, seed["text"], seed["category"], tiers_map)
 
 
-def deepen_islands_and_archipelagos(reg: PromptRegistry) -> None:
-    """Ensure Bonaire, Aruba, Curacao, island countries, atolls, volcanic islands, and Caribbean entities are all included."""
-    island_queries = [
-        ("island_countries", "Q112099", 1),
-        ("atolls", "Q42523", 2),
-        ("volcanic_islands", "Q1161182", 2),
-        ("caribbean_public", "Q3237519", 1),
-        ("island_groups", "Q1402592", 2),
-    ]
-    extra_islands: list[tuple[str, float, list[str]]] = list(CURATED_ISLANDS)
-    for name, qid, min_sl in island_queries:
-        q = f"""
-SELECT ?itemLabel ?sitelinks WHERE {{
-  ?item wdt:P31 wd:{qid} .
+def label_q(where_body: str, min_sl: int, limit: int, extra_vars: str = "", distinct: bool = False) -> str:
+    dist = "DISTINCT " if distinct else ""
+    sel_vars = f"?item ?itemLabel {extra_vars} ?sitelinks".replace("  ", " ")
+    return f"""
+SELECT {dist}{sel_vars} WHERE {{
+{where_body}
   ?item wikibase:sitelinks ?sitelinks .
   FILTER(?sitelinks >= {min_sl})
-  SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en". }}
-}} ORDER BY DESC(?sitelinks) LIMIT 1200"""
-        for r in run_sparql_rows(name, q):
-            c = clean_label(r["itemLabel"])
-            if c:
-                extra_islands.append((c[0], float(r.get("sitelinks", 1) or 1), c[1]))
+  ?item rdfs:label ?itemLabel . FILTER(LANG(?itemLabel) = "en")
+}} ORDER BY DESC(?sitelinks) LIMIT {limit}""".strip()
+
+
+CONTINENTS = [
+    ("eu", "Q46", "European", 8),
+    ("as", "Q48", "Asian", 8),
+    ("af", "Q15", "African", 5),
+    ("oc", "Q55643", "Oceanian", 3),
+]
+
+AMERICAS_COUNTRIES = [
+    ("usa", "Q30", "the United States", 6, "VALUES ?ct { wd:Q515 wd:Q1093829 wd:Q1549591 }", 5000),
+    ("canada", "Q16", "Canada", 4, "VALUES ?ct { wd:Q515 wd:Q1549591 wd:Q3957 }", 2500),
+    ("mexico", "Q96", "Mexico", 6, "VALUES ?ct { wd:Q515 wd:Q1549591 wd:Q20202352 wd:Q1852859 }", 2500),
+    ("brazil", "Q155", "Brazil", 8, "VALUES ?ct { wd:Q515 wd:Q1549591 wd:Q3184121 }", 3000),
+    ("argentina", "Q414", "Argentina", 4, "VALUES ?ct { wd:Q515 wd:Q1549591 wd:Q3957 }", 2000),
+    ("colombia", "Q739", "Colombia", 4, "VALUES ?ct { wd:Q515 wd:Q1549591 wd:Q2555896 }", 2000),
+    ("peru", "Q419", "Peru", 4, "VALUES ?ct { wd:Q515 wd:Q1549591 wd:Q3957 }", 1800),
+    ("chile", "Q298", "Chile", 4, "VALUES ?ct { wd:Q515 wd:Q1549591 wd:Q1840161 }", 1800),
+]
+
+RIVER_COUNTRIES = [
+    ("usa", "Q30", "the United States", 6),
+    ("russia", "Q159", "Russia", 6),
+    ("canada", "Q16", "Canada", 5),
+    ("brazil", "Q155", "Brazil", 5),
+    ("china", "Q148", "China", 5),
+    ("france", "Q142", "France", 5),
+    ("germany", "Q183", "Germany", 5),
+    ("uk", "Q145", "the United Kingdom", 5),
+    ("australia", "Q408", "Australia", 4),
+    ("india", "Q668", "India", 5),
+]
+
+FILM_DECADES = [
+    ("1940s", 1940, 1949, 8),
+    ("1950s", 1950, 1959, 12),
+    ("1960s", 1960, 1969, 12),
+    ("1970s", 1970, 1979, 12),
+    ("1980s", 1980, 1989, 12),
+    ("1990s", 1990, 1999, 14),
+    ("2000s", 2000, 2009, 15),
+    ("2010s", 2010, 2019, 15),
+    ("2020s", 2020, 2025, 12),
+]
+
+FILM_GENRES = [
+    ("action", "Q188473", "Action"),
+    ("adventure", "Q319221", "Adventure"),
+    ("comedy", "Q157443", "Comedy"),
+    ("crime", "Q959790", "Crime"),
+    ("documentary", "Q93204", "Documentary"),
+    ("drama", "Q130232", "Drama"),
+    ("fantasy", "Q157394", "Fantasy"),
+    ("mystery", "Q1200678", "Mystery"),
+    ("romance", "Q1054574", "Romance"),
+    ("romcom", "Q860626", "Romantic Comedy"),
+    ("thriller", "Q2484376", "Thriller"),
+    ("war", "Q369747", "War"),
+    ("biopic", "Q645928", "Biographical"),
+    ("superhero", "Q1535153", "Superhero"),
+    ("family", "Q1361932", "Family"),
+]
+
+FILM_COUNTRIES = [
+    ("france", "Q142", "French"),
+    ("japan", "Q17", "Japanese"),
+    ("uk", "Q145", "British"),
+    ("italy", "Q38", "Italian"),
+    ("germany", "Q183", "German"),
+    ("india", "Q668", "Indian"),
+    ("korea", "Q884", "South Korean"),
+    ("spain", "Q29", "Spanish"),
+    ("canada", "Q16", "Canadian"),
+    ("australia", "Q408", "Australian"),
+    ("sweden", "Q34", "Swedish"),
+    ("mexico", "Q96", "Mexican"),
+    ("china", "Q148", "Chinese"),
+    ("russia", "Q159", "Russian"),
+    ("brazil", "Q155", "Brazilian"),
+]
+
+TV_COUNTRIES = [
+    ("us", "Q30", "American"),
+    ("uk", "Q145", "British"),
+    ("jp", "Q17", "Japanese"),
+    ("kr", "Q884", "South Korean"),
+    ("ca", "Q16", "Canadian"),
+]
+
+MASTER_LISTS: list[tuple[str, str, int, int, str, str, str, str | None]] = [
+    # (cache_key, where_body, min_sl, limit, pid, prompt_text, cat, fallback_where_or_minsl)
+    ("books", "  ?item wdt:P31 wd:Q7725634 .", 12, 6500, "gen-book", "Name a famous book or novel", "general", None),
+    ("actors", "  ?item wdt:P106 wd:Q33999 .", 28, 6000, "mov-actor", "Name a film or TV actor", "movies", None),
+    ("painters", "  ?item wdt:P106 wd:Q1028181 .", 18, 4500, "gen-painter", "Name a famous painter or artist", "general", None),
+    ("bands", "  VALUES ?bt { wd:Q215380 wd:Q5741069 }\n  ?item wdt:P31 ?bt .", 15, 6500, "gen-band", "Name a musical band or group", "general", None),
+    ("singers", "  ?item wdt:P106 wd:Q177220 .", 26, 6000, "gen-singer", "Name a singer or vocalist", "general", None),
+    ("albums", "  ?item wdt:P31 wd:Q482994 .", 12, 6000, "gen-album", "Name a studio album", "general", None),
+    ("languages", "  ?item wdt:P31 wd:Q34770 .", 6, 3000, "gen-language", "Name a world language", "general", None),
+    ("universities", "  ?item wdt:P31 wd:Q3918 .", 20, 4500, "gen-university", "Name a university or college", "general", None),
+    ("museums", "  ?item wdt:P31 wd:Q33506 .", 12, 4000, "gen-museum", "Name a museum", "general", None),
+    ("castles", "  ?item wdt:P31 wd:Q23413 .", 8, 4000, "gen-castle", "Name a castle or palace", "general", None),
+    ("airlines", "  ?item wdt:P31 wd:Q46970 .", 8, 3000, "gen-airline", "Name an airline", "general", None),
+    ("airports", "  ?item wdt:P31 wd:Q1248784 .", 14, 4500, "geo-airport", "Name an international airport", "geography", None),
+    ("battles", "  ?item wdt:P31 wd:Q178561 .", 15, 4500, "gen-battle", "Name a historical battle", "general", None),
+    ("wars", "  ?item wdt:P31 wd:Q198 .", 15, 4000, "gen-war", "Name a historical war or conflict", "general", None),
+    ("dishes", "  { ?item wdt:P31 wd:Q746549 } UNION { ?item wdt:P279 wd:Q746549 } .", 5, 4500, "gen-dish", "Name a traditional dish or food", "general", None),
+    ("football_clubs", "  ?item wdt:P31 wd:Q476028 .", 15, 5000, "spt-football-club", "Name a football (soccer) club", "sports", None),
+    ("nba_players", "  ?item wdt:P106 wd:Q3665646 .", 16, 4500, "spt-nba-player", "Name a basketball player", "sports", None),
+    ("baseball_players", "  ?item wdt:P106 wd:Q10871364 .", 12, 4000, "spt-mlb-player", "Name a baseball player", "sports", None),
+    ("f1_drivers", "  ?item wdt:P106 wd:Q10841764 .", 10, 3000, "spt-f1-driver", "Name a Formula 1 driver", "sports", None),
+    ("boxers", "  ?item wdt:P106 wd:Q11338576 .", 12, 4000, "spt-boxer", "Name a boxer", "sports", None),
+    ("chess_players", "  ?item wdt:P106 wd:Q10873124 .", 10, 3500, "spt-chess-player", "Name a chess grandmaster or player", "sports", None),
+    ("golfers_v2", "  ?item wdt:P106 wd:Q490253 .", 4, 2500, "spt-golfer", "Name a professional golfer", "sports", None),
+    ("nfl_players", "  ?item wdt:P106 wd:Q19204627 .", 12, 4500, "spt-nfl-player", "Name an American football (NFL) player", "sports", None),
+    ("nhl_players", "  ?item wdt:P106 wd:Q11774891 .", 12, 4500, "spt-nhl-player", "Name an ice hockey (NHL) player", "sports", None),
+    ("swimmers", "  ?item wdt:P106 wd:Q10843402 .", 10, 3500, "spt-swimmer", "Name a competitive swimmer", "sports", None),
+    ("cyclists", "  ?item wdt:P106 wd:Q2309784 .", 12, 4500, "spt-cyclist", "Name a professional cyclist", "sports", None),
+    ("cricketers", "  ?item wdt:P106 wd:Q12299841 .", 10, 4000, "spt-cricketer", "Name a cricketer", "sports", None),
+    ("philosophers", "  ?item wdt:P106 wd:Q4964182 .", 16, 4000, "gen-philosopher", "Name a philosopher", "general", None),
+    ("architects", "  ?item wdt:P106 wd:Q42973 .", 12, 4000, "gen-architect", "Name a famous architect", "general", None),
+    ("inventors", "  ?item wdt:P106 wd:Q205375 .", 12, 4000, "gen-inventor", "Name an inventor", "general", None),
+    ("explorers", "  ?item wdt:P106 wd:Q11900058 .", 10, 3000, "gen-explorer", "Name a famous explorer", "general", None),
+    ("monarchs", "  { ?item wdt:P39 wd:Q116 } UNION { ?item wdt:P106 wd:Q116 } .", 12, 3000, "gen-monarch", "Name a monarch, king, or queen", "general", None),
+    ("companies", "  ?item wdt:P31 wd:Q4830453 .", 22, 5000, "gen-company", "Name a well-known company or corporation", "general", None),
+    ("websites", "  ?item wdt:P31 wd:Q35127 .", 12, 4000, "gen-website", "Name a website or online platform", "general", None),
+    ("spacecraft", "  { ?item wdt:P31 wd:Q40218 } UNION { ?item wdt:P31 wd:Q26529 } .", 5, 2500, "gen-spacecraft", "Name a spacecraft or space probe", "general", None),
+    ("stars", "  ?item wdt:P31 wd:Q523 .", 18, 3000, "gen-star", "Name a star in the night sky", "general", None),
+    ("compounds", "  ?item wdt:P31 wd:Q113145171 .", 26, 4000, "gen-compound", "Name a chemical compound or molecule", "general", "28"),
+    ("diseases", "  { ?item wdt:P31 wd:Q12136 } UNION { ?item wdt:P31 wd:Q112193867 } .", 8, 4000, "gen-disease", "Name a medical disease or condition", "general", "14"),
+    ("cat_breeds", "  ?item wdt:P31 wd:Q43577 .", 1, 1500, "gen-cat-breed", "Name a cat breed", "general", None),
+    ("horse_breeds", "  ?item wdt:P31 wd:Q23002039 .", 1, 1800, "gen-horse-breed", "Name a horse breed", "general", None),
+    ("breads", "  { ?item wdt:P31 wd:Q7802 } UNION { ?item wdt:P279 wd:Q7802 } .", 1, 2000, "gen-bread", "Name a type of bread", "general", None),
+    ("soups", "  { ?item wdt:P31 wd:Q41415 } UNION { ?item wdt:P279 wd:Q41415 } .", 1, 2000, "gen-soup", "Name a soup or stew", "general", None),
+    ("sauces", "  { ?item wdt:P31 wd:Q178359 } UNION { ?item wdt:P279 wd:Q178359 } .", 1, 2000, "gen-sauce", "Name a sauce or condiment", "general", None),
+    ("pastries", "  { ?item wdt:P31 wd:Q477248 } UNION { ?item wdt:P279 wd:Q477248 } .", 1, 2000, "gen-pastry", "Name a pastry or baked sweet", "general", None),
+    ("wine_grapes", "  ?item wdt:P31 wd:Q958314 .", 1, 1500, "gen-grape", "Name a wine grape variety", "general", None),
+    ("comics_chars", "  ?item wdt:P31 wd:Q1114461 .", 6, 4000, "gen-comic-char", "Name a comic book character", "general", None),
+    ("skyscrapers", "  ?item wdt:P31 wd:Q11303 .", 6, 3500, "geo-skyscraper", "Name a skyscraper or tall tower", "geography", None),
+    ("glaciers", "  ?item wdt:P31 wd:Q35666 .", 3, 2500, "geo-glacier", "Name a glacier", "geography", None),
+    ("caves", "  ?item wdt:P31 wd:Q35509 .", 4, 2500, "geo-cave", "Name a cave or cavern", "geography", None),
+    ("canyons", "  ?item wdt:P31 wd:Q150784 .", 2, 1800, "geo-canyon", "Name a canyon or gorge", "geography", None),
+    ("bays", "  ?item wdt:P31 wd:Q39594 .", 4, 2500, "geo-bay", "Name a bay or gulf", "geography", None),
+    ("capes", "  ?item wdt:P31 wd:Q185113 .", 4, 2500, "geo-cape", "Name a cape or headland", "geography", None),
+    (
+        "nobel_laureates",
+        "  VALUES ?award { wd:Q38104 wd:Q44585 wd:Q80061 wd:Q37922 wd:Q35637 wd:Q47170 }\n  ?item wdt:P166 ?award .",
+        5,
+        2000,
+        "gen-nobel",
+        "Name a Nobel Prize laureate",
+        "general",
+        None,
+    ),
+]
+
+SEED_DEEPEN_QUERIES: list[tuple[str, str, int, int, str]] = [
+    ("rivers_world", "  ?item wdt:P31 wd:Q4022 .", 7, 7000, "geo-river"),
+    ("lakes_world", "  ?item wdt:P31 wd:Q23397 .", 7, 6000, "geo-lake"),
+    ("mountain_ranges_world", "  ?item wdt:P31 wd:Q46831 .", 3, 4000, "geo-mountain-range"),
+    ("national_parks_world", "  ?item wdt:P31 wd:Q46169 .", 3, 4500, "geo-national-park"),
+    ("landmarks_world", "  { ?item wdt:P1435 wd:Q9259 } UNION { ?item wdt:P31 wd:Q4989906 } .", 18, 5000, "geo-landmark"),
+    ("waterfalls_world", "  ?item wdt:P31 wd:Q34038 .", 1, 3000, "geo-waterfall"),
+    ("deserts_world", "  ?item wdt:P31 wd:Q8514 .", 1, 2000, "geo-desert"),
+    ("volcanoes_world", "  ?item wdt:P31 wd:Q8072 .", 4, 4000, "gen-volcano"),
+    ("bridges_world", "  ?item wdt:P31 wd:Q12280 .", 5, 4000, "gen-bridge"),
+    ("stadiums_world", "  ?item wdt:P31 wd:Q483110 .", 6, 5000, "spt-stadium"),
+    ("films_scifi_deep", "  ?item wdt:P31 wd:Q11424 .\n  ?item wdt:P136 wd:Q471839 .", 6, 5000, "mov-scifi-classic"),
+    ("films_horror_deep", "  ?item wdt:P31 wd:Q11424 .\n  ?item wdt:P136 wd:Q200092 .", 6, 5000, "mov-horror"),
+    ("directors_deep", "  ?item wdt:P106 wd:Q2526255 .", 25, 5000, "mov-director"),
+    ("composers_deep", "  ?item wdt:P106 wd:Q36834 .", 12, 5000, "gen-composer"),
+    ("scientists_deep", "  VALUES ?occ { wd:Q901 wd:Q169470 wd:Q593644 }\n  ?item wdt:P106 ?occ .", 20, 5000, "gen-scientist"),
+    ("paintings_deep", "  ?item wdt:P31 wd:Q3305213 .", 5, 5000, "gen-painting"),
+    ("music_genres_deep", "  ?item wdt:P31 wd:Q188451 .", 2, 4000, "gen-music-genre"),
+    ("board_games_deep", "  ?item wdt:P31 wd:Q131436 .", 1, 4000, "gen-board-game"),
+    ("superheroes_deep", "  { ?item wdt:P31 wd:Q188784 } UNION { ?item wdt:P106 wd:Q188784 } .", 1, 3500, "gen-superhero"),
+]
+
+PEOPLE_COUNTRY_QUERIES = [
+    ("authors_country", "Q36180", "P106", "P27", 30, "gen-author-nat", "Name an author from {G}", "general"),
+    ("bands_country", "Q215380", "P31", "P495", 14, "gen-band-nat", "Name a band from {G}", "general"),
+    ("clubs_country", "Q476028", "P31", "P17", 12, "spt-club-nat", "Name a football club in {G}", "sports"),
+    ("stadiums_country", "Q483110", "P31", "P17", 6, "spt-stad-nat", "Name a sports stadium in {G}", "sports"),
+    ("islands_country", "Q23442", "P31", "P17", 6, "geo-isl-nat", "Name an island in {G}", "geography"),
+    ("lakes_country", "Q23397", "P31", "P17", 6, "geo-lak-nat", "Name a lake in {G}", "geography"),
+    ("parks_country", "Q46169", "P31", "P17", 3, "geo-prk-nat", "Name a national park in {G}", "geography"),
+    ("unesco_country", "Q9259", "P1435", "P17", 4, "geo-her-nat", "Name a World Heritage Site in {G}", "geography"),
+    ("dishes_country", "Q746549", "P31", "P495", 2, "gen-dish-nat", "Name a traditional food or dish from {G}", "general"),
+    ("universities_country", "Q3918", "P31", "P17", 15, "gen-uni-nat", "Name a university in {G}", "general"),
+    ("museums_country", "Q33506", "P31", "P17", 8, "gen-mus-nat", "Name a museum in {G}", "general"),
+    ("castles_country", "Q23413", "P31", "P17", 5, "gen-cas-nat", "Name a castle or palace in {G}", "general"),
+]
+
+
+def fetch_all_master_v2_queries() -> dict[str, list[dict[str, str]]]:
+    datasets: dict[str, list[dict[str, str]]] = {}
+
+    # 1. Islands & archipelagos (broadened P31 + volcanic_islands fixed to Q1161185)
+    island_queries = [
+        ("islands_main", "Q23442", 8, 7000),
+        ("island_countries", "Q112099", 1, 1200),
+        ("atolls", "Q42523", 1, 1500),
+        ("volcanic_islands", "Q1161185", 1, 1500),
+        ("caribbean_public", "Q3237519", 1, 100),
+        ("island_groups", "Q1402592", 1, 1500),
+        ("archipelagos_broad", "Q33837", 2, 2500),
+    ]
+    for name, qid, min_sl, lim in island_queries:
+        q = label_q(f"  ?item wdt:P31 wd:{qid} .", min_sl, lim)
+        datasets[name] = dedup_rows_by_qid(run_sparql_rows(name, q))
+
+    # 2. Cities by continent, country, Americas, US states, Australia
+    for code, qid, _cname, min_sl in CONTINENTS:
+        if code in {"eu", "af"}:
+            eff_sl = 12 if code == "eu" else 6
+            lim = 4500 if code == "eu" else 3500
+            q = f"""
+SELECT ?item ?itemLabel ?countryLabel ?sitelinks WHERE {{
+  ?item wdt:P31 wd:Q515 .
+  ?item wdt:P17 ?country .
+  ?country wdt:P30 wd:{qid} .
+  ?item wikibase:sitelinks ?sitelinks .
+  FILTER(?sitelinks >= {eff_sl})
+  ?item rdfs:label ?itemLabel . FILTER(LANG(?itemLabel) = "en")
+  ?country rdfs:label ?countryLabel . FILTER(LANG(?countryLabel) = "en")
+}} ORDER BY DESC(?sitelinks) LIMIT {lim}""".strip()
+        else:
+            q = f"""
+SELECT DISTINCT ?item ?itemLabel ?countryLabel ?sitelinks WHERE {{
+  VALUES ?ct {{ wd:Q515 wd:Q1549591 wd:Q51929311 }}
+  ?item wdt:P31 ?ct .
+  ?item wdt:P17 ?country .
+  ?country wdt:P30 wd:{qid} .
+  ?item wikibase:sitelinks ?sitelinks .
+  FILTER(?sitelinks >= {min_sl})
+  ?item rdfs:label ?itemLabel . FILTER(LANG(?itemLabel) = "en")
+  ?country rdfs:label ?countryLabel . FILTER(LANG(?countryLabel) = "en")
+}} ORDER BY DESC(?sitelinks) LIMIT 5000""".strip()
+        datasets[f"cities_{code}"] = dedup_rows_by_qid(run_sparql_rows(f"cities_{code}", q))
+
+    for code, qid, _cname, min_sl, ct_vals, lim in AMERICAS_COUNTRIES:
+        q = label_q(f"  {ct_vals}\n  ?item wdt:P31 ?ct .\n  ?item wdt:P17 wd:{qid} .", min_sl, lim, distinct=True)
+        datasets[f"cities_am_{code}"] = dedup_rows_by_qid(run_sparql_rows(f"cities_am_{code}", q))
+
+    aus_city_q = label_q(
+        "  VALUES ?ct { wd:Q515 wd:Q1549591 wd:Q3957 }\n  ?item wdt:P31 ?ct .\n  ?item wdt:P17 wd:Q408 .",
+        3,
+        2500,
+        distinct=True,
+    )
+    datasets["cities_australia_broad"] = dedup_rows_by_qid(run_sparql_rows("cities_australia_broad", aus_city_q))
+
+    us_states_q = """
+SELECT ?item ?itemLabel ?stateLabel ?sitelinks WHERE {
+  ?item wdt:P31 wd:Q1093829 .
+  ?item wdt:P131 ?state .
+  ?state wdt:P31 wd:Q35657 .
+  ?item wikibase:sitelinks ?sitelinks .
+  FILTER(?sitelinks >= 4)
+  ?item rdfs:label ?itemLabel . FILTER(LANG(?itemLabel) = "en")
+  ?state rdfs:label ?stateLabel . FILTER(LANG(?stateLabel) = "en")
+} ORDER BY DESC(?sitelinks) LIMIT 6000""".strip()
+    datasets["us_cities_by_state"] = dedup_rows_by_qid(run_sparql_rows("us_cities_by_state", us_states_q))
+
+    # 3. Rivers by country
+    for code, qid, _cname, min_sl in RIVER_COUNTRIES:
+        q = label_q(f"  ?item wdt:P31 wd:Q4022 .\n  ?item wdt:P17 wd:{qid} .", min_sl, 2000)
+        datasets[f"rivers_{code}"] = dedup_rows_by_qid(run_sparql_rows(f"rivers_{code}", q))
+
+    # 4. Mountains world (new deep pool)
+    mountains_q = label_q("  ?item wdt:P31 wd:Q8502 .", 10, 6000)
+    datasets["mountains_world"] = dedup_rows_by_qid(run_sparql_rows("mountains_world", mountains_q))
+
+    # 5. Films by decade (now includes 1950s!), genre, and country
+    for dlabel, y0, y1, min_sl in FILM_DECADES:
+        q = f"""
+SELECT ?item ?itemLabel (YEAR(?pub) AS ?year) ?sitelinks WHERE {{
+  ?item wdt:P31 wd:Q11424 .
+  ?item wdt:P577 ?pub .
+  FILTER(?pub >= "{y0}-01-01T00:00:00Z"^^xsd:dateTime && ?pub < "{y1 + 1}-01-01T00:00:00Z"^^xsd:dateTime)
+  ?item wikibase:sitelinks ?sitelinks .
+  FILTER(?sitelinks >= {min_sl})
+  ?item rdfs:label ?itemLabel . FILTER(LANG(?itemLabel) = "en")
+}} ORDER BY DESC(?sitelinks) LIMIT 4000""".strip()
+        datasets[f"films_{dlabel}"] = dedup_rows_by_qid(
+            run_sparql_rows(f"films_{dlabel}", q), keep_min_year=True
+        )
+
+    for gid, qid, _gname in FILM_GENRES:
+        q = label_q(f"  ?item wdt:P31 wd:Q11424 .\n  ?item wdt:P136 wd:{qid} .", 8, 4000)
+        datasets[f"film_genre_{gid}"] = dedup_rows_by_qid(run_sparql_rows(f"film_genre_{gid}", q))
+
+    for cid, qid, _adj in FILM_COUNTRIES:
+        q = label_q(f"  ?item wdt:P31 wd:Q11424 .\n  ?item wdt:P495 wd:{qid} .", 8, 3000)
+        datasets[f"film_country_{cid}"] = dedup_rows_by_qid(run_sparql_rows(f"film_country_{cid}", q))
+
+    # 6. TV series, Anime, Manga, Hit songs, Video games + genres
+    datasets["tv_series_v2"] = dedup_rows_by_qid(
+        run_sparql_rows("tv_series_v2", label_q("  ?item wdt:P31 wd:Q5398426 .", 10, 6500))
+    )
+    for code, qid, _adj in TV_COUNTRIES:
+        q = label_q(f"  ?item wdt:P31 wd:Q5398426 .\n  ?item wdt:P495 wd:{qid} .", 8, 3000)
+        datasets[f"tv_{code}"] = dedup_rows_by_qid(run_sparql_rows(f"tv_{code}", q))
+
+    datasets["anime_series"] = dedup_rows_by_qid(
+        run_sparql_rows("anime_series", label_q("  ?item wdt:P31 wd:Q63952888 .", 5, 4000))
+    )
+    datasets["manga_series"] = dedup_rows_by_qid(
+        run_sparql_rows("manga_series", label_q("  ?item wdt:P31 wd:Q21198342 .", 5, 4000))
+    )
+    datasets["hit_songs"] = dedup_rows_by_qid(
+        run_sparql_rows(
+            "hit_songs",
+            label_q("  VALUES ?st { wd:Q134556 wd:Q7366 }\n  ?item wdt:P31 ?st .", 16, 6500, distinct=True),
+        )
+    )
+    datasets["video_games"] = dedup_rows_by_qid(
+        run_sparql_rows("video_games", label_q("  ?item wdt:P31 wd:Q7889 .", 12, 6500))
+    )
+
+    vg_genre_queries = [
+        ("rpg", "  ?item wdt:P31 wd:Q7889 .\n  ?item wdt:P136 wd:Q744038 .", 8, 2500),
+        ("fps", "  ?item wdt:P31 wd:Q7889 .\n  ?item wdt:P136 wd:Q185029 .", 8, 2500),
+        ("platformer", "  ?item wdt:P31 wd:Q7889 .\n  ?item wdt:P136 wd:Q828322 .", 8, 2500),
+        ("strategy", "  ?item wdt:P31 wd:Q7889 .\n  ?item wdt:P136/wdt:P279* wd:Q472055 .", 6, 2500),
+        ("racing", "  ?item wdt:P31 wd:Q7889 .\n  ?item wdt:P136 wd:Q860750 .", 8, 2500),
+        ("fighting", "  ?item wdt:P31 wd:Q7889 .\n  ?item wdt:P136 wd:Q343568 .", 8, 2500),
+        ("horror", "  ?item wdt:P31 wd:Q7889 .\n  { ?item wdt:P136 wd:Q333967 } UNION { ?item wdt:P136 wd:Q11338014 } .", 4, 2000),
+    ]
+    for gid, where_b, min_sl, lim in vg_genre_queries:
+        datasets[f"vg_genre_{gid}"] = dedup_rows_by_qid(
+            run_sparql_rows(f"vg_genre_{gid}", label_q(where_b, min_sl, lim, distinct=True))
+        )
+
+    # 7. Master lists + broadened open seed deepening queries
+    for key, where_b, min_sl, lim, _pid, _ptext, _cat, fb_sl in MASTER_LISTS:
+        q = label_q(where_b, min_sl, lim, distinct=("VALUES" in where_b or "UNION" in where_b))
+        fb_q = (
+            label_q(where_b, int(fb_sl), lim, distinct=("VALUES" in where_b or "UNION" in where_b))
+            if fb_sl
+            else None
+        )
+        datasets[key] = dedup_rows_by_qid(run_sparql_rows(key, q, fb_q))
+
+    for key, where_b, min_sl, lim, _pid in SEED_DEEPEN_QUERIES:
+        q = label_q(where_b, min_sl, lim, distinct=("VALUES" in where_b or "UNION" in where_b))
+        datasets[key] = dedup_rows_by_qid(run_sparql_rows(key, q))
+
+    # 8. Footballers & animal species (fixed fishes_en!)
+    datasets["footballers_v2"] = dedup_rows_by_qid(
+        run_sparql_rows("footballers_v2", label_q("  ?item wdt:P106 wd:Q937857 .", 38, 6000))
+    )
+
+    animal_specs = [
+        ("mammals_en", "Q7377", 25, 2500, False),
+        ("birds_en", "Q5113", 25, 2500, False),
+        ("reptiles_en", "Q10811", 22, 2500, False),
+        ("fishes_en", "{ ?item wdt:P171* wd:Q127282 } UNION { ?item wdt:P171* wd:Q25371 } .", 15, 2500, True),
+    ]
+    for key, clade, min_sl, lim, is_custom in animal_specs:
+        if is_custom:
+            where_b = f"  ?item wdt:P105 wd:Q7432 .\n  {clade}"
+            q = label_q(where_b, min_sl, lim, distinct=True)
+        else:
+            where_b = f'  ?item wdt:P1843 ?common .\n  FILTER(LANG(?common) = "en")\n  ?item wdt:P105 wd:Q7432 .\n  ?item wdt:P171* wd:{clade} .'
+            q = label_q(where_b, min_sl, lim, distinct=True)
+        datasets[key] = dedup_rows_by_qid(run_sparql_rows(key, q))
+
+    # 9. People & places by country
+    for key, qid, prop, grp_prop, min_sl, _id_pref, _fmt, _cat in PEOPLE_COUNTRY_QUERIES:
+        q = f"""
+SELECT DISTINCT ?item ?itemLabel ?grpLabel ?sitelinks WHERE {{
+  ?item wdt:{prop} wd:{qid} .
+  ?item wdt:{grp_prop} ?grp .
+  ?item wikibase:sitelinks ?sitelinks .
+  FILTER(?sitelinks >= {min_sl})
+  ?item rdfs:label ?itemLabel . FILTER(LANG(?itemLabel) = "en")
+  ?grp rdfs:label ?grpLabel . FILTER(LANG(?grpLabel) = "en")
+}} ORDER BY DESC(?sitelinks) LIMIT 5000""".strip()
+        datasets[key] = dedup_rows_by_qid(run_sparql_rows(key, q))
+
+    return datasets
+
+
+def deepen_islands_and_archipelagos(
+    reg: PromptRegistry,
+    datasets: dict[str, list[dict[str, str]]],
+    alias_map: dict[str, list[str]],
+) -> None:
+    """Ensure Bonaire, Aruba, Curacao, island countries, atolls, volcanic islands, and Caribbean entities are all included."""
+    extra_islands: list[tuple[str, float, list[str]]] = list(CURATED_ISLANDS)
+    for name in [
+        "islands_main",
+        "island_countries",
+        "atolls",
+        "volcanic_islands",
+        "caribbean_public",
+        "island_groups",
+        "archipelagos_broad",
+    ]:
+        extra_islands.extend(rows_to_scored_items(datasets.get(name, []), alias_map))
 
     reg.upgrade("geo-island", extra_islands, MAX_SEED_ANSWERS)
     reg.upgrade("geo-archipelago", extra_islands, MAX_SEED_ANSWERS)
@@ -537,6 +1128,7 @@ def slice_existing_prompts(reg: PromptRegistry) -> int:
         ("geo-river", "Name a river starting with the letter {L}", "geography"),
         ("geo-island", "Name an island starting with the letter {L}", "geography"),
         ("geo-mountain-range", "Name a mountain range starting with the letter {L}", "geography"),
+        ("geo-mountain", "Name a mountain or peak starting with the letter {L}", "geography"),
         ("geo-national-park", "Name a national park starting with the letter {L}", "geography"),
         ("geo-lake", "Name a lake starting with the letter {L}", "geography"),
         ("geo-strait-canal", "Name a strait or canal starting with the letter {L}", "geography"),
@@ -581,7 +1173,11 @@ def slice_existing_prompts(reg: PromptRegistry) -> int:
     return added
 
 
-def enrich_from_master_wikidata(reg: PromptRegistry) -> int:
+def assemble_master_prompts(
+    reg: PromptRegistry,
+    datasets: dict[str, list[dict[str, str]]],
+    alias_map: dict[str, list[str]],
+) -> int:
     added = 0
 
     def add_group_slices(
@@ -593,19 +1189,15 @@ def enrich_from_master_wikidata(reg: PromptRegistry) -> int:
         min_group: int = MIN_ANSWERS + 4,
     ) -> None:
         nonlocal added
-        buckets: dict[str, list[tuple[str, float, list[str]]]] = defaultdict(list)
+        buckets: dict[str, list[dict[str, str]]] = defaultdict(list)
         for r in rows:
             grp = r.get(group_key, "").strip()
             if not grp or re.match(r"^Q\d+$", grp):
                 continue
-            cleaned = clean_label(r["itemLabel"])
-            if not cleaned:
-                continue
-            canon, aliases = cleaned
-            sl = float(r.get("sitelinks", 1) or 1)
-            buckets[grp].append((canon, sl, aliases))
+            buckets[grp].append(r)
 
-        for grp, items in sorted(buckets.items()):
+        for grp, grp_rows in sorted(buckets.items()):
+            items = rows_to_scored_items(grp_rows, alias_map)
             if len(items) < min_group:
                 continue
             slug = re.sub(r"[^a-z0-9]+", "-", grp.lower()).strip("-")
@@ -624,17 +1216,16 @@ def enrich_from_master_wikidata(reg: PromptRegistry) -> int:
         category: str,
     ) -> None:
         nonlocal added
-        buckets: dict[str, list[tuple[str, float, list[str]]]] = defaultdict(list)
+        buckets: dict[str, list[dict[str, str]]] = defaultdict(list)
         for r in rows:
             cleaned = clean_label(r["itemLabel"])
             if not cleaned:
                 continue
-            canon, aliases = cleaned
-            ltr = first_alpha_letter(canon)
+            ltr = first_alpha_letter(cleaned[0])
             if ltr:
-                sl = float(r.get("sitelinks", 1) or 1)
-                buckets[ltr].append((canon, sl, aliases))
-        for ltr, items in sorted(buckets.items()):
+                buckets[ltr].append(r)
+        for ltr, ltr_rows in sorted(buckets.items()):
+            items = rows_to_scored_items(ltr_rows, alias_map)
             if len(items) < MIN_ANSWERS:
                 continue
             if reg.add(
@@ -645,131 +1236,65 @@ def enrich_from_master_wikidata(reg: PromptRegistry) -> int:
             ):
                 added += 1
 
-    # 1. Cities by continent, country, and Americas/major countries
-    continents = [
-        ("eu", "Q46", "European", 10),
-        ("as", "Q48", "Asian", 10),
-        ("af", "Q15", "African", 6),
-        ("oc", "Q55643", "Oceanian", 3),
-    ]
+    # 1. Cities by continent, Americas, South America, Australia, Canada, US states
     all_cities: list[dict[str, str]] = []
-    for code, qid, cname, min_sl in continents:
-        q = f"""
-SELECT ?itemLabel ?countryLabel ?sitelinks WHERE {{
-  ?item wdt:P31 wd:Q515 .
-  ?item wdt:P17 ?country .
-  ?country wdt:P30 wd:{qid} .
-  ?item wikibase:sitelinks ?sitelinks .
-  FILTER(?sitelinks >= {min_sl})
-  SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en". }}
-}} ORDER BY DESC(?sitelinks) LIMIT 2800"""
-        rows = run_sparql_rows(f"cities_{code}", q)
+    for code, _qid, cname, _min_sl in CONTINENTS:
+        rows = datasets.get(f"cities_{code}", [])
         all_cities.extend(rows)
         add_group_slices(rows, "countryLabel", f"geo-city-{code}", "Name a city in {G}", "geography")
         add_letter_slices(rows, f"geo-city-{code}", f"Name a {cname} city starting with the letter {{L}}", "geography")
 
-    # Fast per-country Americas cities (fixes cities_na / cities_sa timeouts!)
-    americas_countries = [
-        ("usa", "Q30", "the United States", 10),
-        ("canada", "Q16", "Canada", 4),
-        ("mexico", "Q96", "Mexico", 6),
-        ("brazil", "Q155", "Brazil", 6),
-        ("argentina", "Q414", "Argentina", 5),
-        ("colombia", "Q739", "Colombia", 4),
-        ("peru", "Q419", "Peru", 4),
-        ("chile", "Q298", "Chile", 4),
-    ]
-    for code, qid, cname, min_sl in americas_countries:
-        q = f"""
-SELECT ?itemLabel ?sitelinks WHERE {{
-  ?item wdt:P31 wd:Q515 .
-  ?item wdt:P17 wd:{qid} .
-  ?item wikibase:sitelinks ?sitelinks .
-  FILTER(?sitelinks >= {min_sl})
-  SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en". }}
-}} ORDER BY DESC(?sitelinks) LIMIT 1600"""
-        rows = run_sparql_rows(f"cities_am_{code}", q)
+    sa_combined_items: list[tuple[str, float, list[str]]] = []
+    sa_codes = {"brazil", "argentina", "colombia", "peru", "chile"}
+    for code, _qid, cname, _min_sl, _ct, _lim in AMERICAS_COUNTRIES:
+        rows = datasets.get(f"cities_am_{code}", [])
         all_cities.extend(rows)
-        items = [(c[0], float(r.get("sitelinks", 1) or 1), c[1]) for r in rows if (c := clean_label(r["itemLabel"]))]
-        reg.add(f"geo-city-am-{code}", f"Name a city in {cname}", "geography", build_balanced_tiers(items))
+        items = rows_to_scored_items(rows, alias_map)
+        if code in sa_codes:
+            sa_combined_items.extend(items)
+        if reg.add(f"geo-city-am-{code}", f"Name a city in {cname}", "geography", build_balanced_tiers(items, MAX_SEED_ANSWERS)):
+            added += 1
         add_letter_slices(rows, f"geo-city-am-{code}", f"Name a city in {cname} starting with the letter {{L}}", "geography")
 
-    # U.S. cities by state
-    us_states_q = """
-SELECT ?itemLabel ?stateLabel ?sitelinks WHERE {
-  ?item wdt:P31 wd:Q1093829 .
-  ?item wdt:P131 ?state .
-  ?state wdt:P31 wd:Q35657 .
-  ?item wikibase:sitelinks ?sitelinks .
-  FILTER(?sitelinks >= 4)
-  SERVICE wikibase:label { bd:serviceParam wikibase:language "en". }
-} ORDER BY DESC(?sitelinks) LIMIT 3500"""
-    us_cities = run_sparql_rows("us_cities_by_state", us_states_q)
+    reg.upgrade("geo-south-america-city", sa_combined_items, MAX_SEED_ANSWERS)
+    reg.upgrade("geo-canada-city", rows_to_scored_items(datasets.get("cities_am_canada", []), alias_map), MAX_SEED_ANSWERS)
+    reg.upgrade("geo-australia-city", rows_to_scored_items(datasets.get("cities_australia_broad", []), alias_map), MAX_SEED_ANSWERS)
+
+    us_cities = datasets.get("us_cities_by_state", [])
     add_group_slices(us_cities, "stateLabel", "geo-us-city", "Name a city in {G}", "geography")
     add_letter_slices(all_cities, "geo-world-city", "Name a world city starting with the letter {L}", "geography")
 
-    # Fast per-country rivers (fixes rivers_country timeout!)
-    river_countries = [
-        ("usa", "Q30", "the United States", 8),
-        ("russia", "Q159", "Russia", 8),
-        ("canada", "Q16", "Canada", 6),
-        ("brazil", "Q155", "Brazil", 6),
-        ("china", "Q148", "China", 6),
-        ("france", "Q142", "France", 6),
-        ("germany", "Q183", "Germany", 6),
-        ("uk", "Q145", "the United Kingdom", 6),
-        ("australia", "Q408", "Australia", 5),
-        ("india", "Q668", "India", 6),
-    ]
-    for code, qid, cname, min_sl in river_countries:
-        q = f"""
-SELECT ?itemLabel ?sitelinks WHERE {{
-  ?item wdt:P31 wd:Q4022 .
-  ?item wdt:P17 wd:{qid} .
-  ?item wikibase:sitelinks ?sitelinks .
-  FILTER(?sitelinks >= {min_sl})
-  SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en". }}
-}} ORDER BY DESC(?sitelinks) LIMIT 800"""
-        rows = run_sparql_rows(f"rivers_{code}", q)
-        items = [(c[0], float(r.get("sitelinks", 1) or 1), c[1]) for r in rows if (c := clean_label(r["itemLabel"]))]
-        reg.add(f"geo-riv-{code}", f"Name a river in {cname}", "geography", build_balanced_tiers(items))
+    # 2. Rivers & mountains
+    for code, _qid, cname, _min_sl in RIVER_COUNTRIES:
+        rows = datasets.get(f"rivers_{code}", [])
+        items = rows_to_scored_items(rows, alias_map)
+        if reg.add(f"geo-riv-{code}", f"Name a river in {cname}", "geography", build_balanced_tiers(items)):
+            added += 1
 
-    # 2. Films by decade, year, genre, genre x decade, country, letter
-    film_decades = [
-        ("1940s", 1940, 1949, 10),
-        ("1960s", 1960, 1969, 14),
-        ("1970s", 1970, 1979, 14),
-        ("1980s", 1980, 1989, 16),
-        ("1990s", 1990, 1999, 18),
-        ("2000s", 2000, 2009, 20),
-        ("2010s", 2010, 2019, 20),
-        ("2020s", 2020, 2025, 16),
-    ]
+    mtn_rows = datasets.get("mountains_world", [])
+    mtn_items = rows_to_scored_items(mtn_rows, alias_map)
+    if reg.add("geo-mountain", "Name a famous mountain or peak", "geography", build_balanced_tiers(mtn_items, MAX_SEED_ANSWERS)):
+        added += 1
+
+    # Upgrade core seed prompts with deep master_v2 pools (+ aliases)
+    for key, _where_b, _min_sl, _lim, pid in SEED_DEEPEN_QUERIES:
+        rows = datasets.get(key, [])
+        reg.upgrade(pid, rows_to_scored_items(rows, alias_map), MAX_SEED_ANSWERS)
+
+    # 3. Films by decade, year, genre, genre x decade, country, letter
     all_films: list[dict[str, str]] = []
     decade_film_norms: dict[str, dict[str, tuple[str, float, list[str]]]] = {}
 
-    for dlabel, y0, y1, min_sl in film_decades:
-        q = f"""
-SELECT ?itemLabel (YEAR(?pub) AS ?year) ?sitelinks WHERE {{
-  ?item wdt:P31 wd:Q11424 .
-  ?item wdt:P577 ?pub .
-  FILTER(?pub >= "{y0}-01-01T00:00:00Z"^^xsd:dateTime && ?pub < "{y1 + 1}-01-01T00:00:00Z"^^xsd:dateTime)
-  ?item wikibase:sitelinks ?sitelinks .
-  FILTER(?sitelinks >= {min_sl})
-  SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en". }}
-}} ORDER BY DESC(?sitelinks) LIMIT 2800"""
-        rows = run_sparql_rows(f"films_{dlabel}", q)
+    for dlabel, _y0, _y1, _min_sl in FILM_DECADES:
+        rows = datasets.get(f"films_{dlabel}", [])
         all_films.extend(rows)
-        dec_items = []
+        dec_items = rows_to_scored_items(rows, alias_map)
         dmap: dict[str, tuple[str, float, list[str]]] = {}
-        for r in rows:
-            c = clean_label(r["itemLabel"])
-            if c:
-                sl = float(r.get("sitelinks", 1) or 1)
-                dec_items.append((c[0], sl, c[1]))
-                dmap[normalize_answer(c[0])] = (c[0], sl, c[1])
+        for item in dec_items:
+            dmap[normalize_answer(item[0])] = item
         decade_film_norms[dlabel] = dmap
-        reg.add(f"mov-decade-{dlabel}", f"Name a movie from the {dlabel}", "movies", build_balanced_tiers(dec_items))
+        if reg.add(f"mov-decade-{dlabel}", f"Name a movie from the {dlabel}", "movies", build_balanced_tiers(dec_items, MAX_SEED_ANSWERS)):
+            added += 1
         add_group_slices(rows, "year", "mov-year", "Name a movie released in {G}", "movies", min_group=35)
         add_letter_slices(rows, f"mov-{dlabel}", f"Name a {dlabel} movie starting with the letter {{L}}", "movies")
 
@@ -778,55 +1303,21 @@ SELECT ?itemLabel (YEAR(?pub) AS ?year) ?sitelinks WHERE {{
         r for r in all_films
         if (c := clean_label(r["itemLabel"])) and " " not in c[0] and "-" not in c[0]
     ]
-    one_word_items = [
-        (c[0], float(r.get("sitelinks", 1) or 1), c[1])
-        for r in one_word_films
-        if (c := clean_label(r["itemLabel"]))
-    ]
-    reg.upgrade("mov-one-word", one_word_items, MAX_SEED_ANSWERS)
+    reg.upgrade("mov-one-word", rows_to_scored_items(one_word_films, alias_map), MAX_SEED_ANSWERS)
     add_letter_slices(one_word_films, "mov-oneword", "Name a one-word movie starting with the letter {L}", "movies")
 
-    film_genres = [
-        ("action", "Q188473", "Action"),
-        ("adventure", "Q319221", "Adventure"),
-        ("comedy", "Q157443", "Comedy"),
-        ("crime", "Q959790", "Crime"),
-        ("documentary", "Q93204", "Documentary"),
-        ("drama", "Q130232", "Drama"),
-        ("fantasy", "Q157394", "Fantasy"),
-        ("mystery", "Q1200678", "Mystery"),
-        ("romance", "Q1054574", "Romance"),
-        ("romcom", "Q860626", "Romantic Comedy"),
-        ("thriller", "Q2484376", "Thriller"),
-        ("war", "Q369747", "War"),
-        ("biopic", "Q645928", "Biographical"),
-        ("superhero", "Q1535153", "Superhero"),
-        ("family", "Q1361932", "Family"),
-    ]
     genre_film_norms: dict[str, tuple[str, dict[str, tuple[str, float, list[str]]]]] = {}
-    for gid, qid, gname in film_genres:
-        q = f"""
-SELECT ?itemLabel ?sitelinks WHERE {{
-  ?item wdt:P31 wd:Q11424 .
-  ?item wdt:P136 wd:{qid} .
-  ?item wikibase:sitelinks ?sitelinks .
-  FILTER(?sitelinks >= 10)
-  SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en". }}
-}} ORDER BY DESC(?sitelinks) LIMIT 2200"""
-        rows = run_sparql_rows(f"film_genre_{gid}", q)
-        items = []
+    for gid, _qid, gname in FILM_GENRES:
+        rows = datasets.get(f"film_genre_{gid}", [])
+        items = rows_to_scored_items(rows, alias_map)
         gmap: dict[str, tuple[str, float, list[str]]] = {}
-        for r in rows:
-            c = clean_label(r["itemLabel"])
-            if c:
-                sl = float(r.get("sitelinks", 1) or 1)
-                items.append((c[0], sl, c[1]))
-                gmap[normalize_answer(c[0])] = (c[0], sl, c[1])
+        for item in items:
+            gmap[normalize_answer(item[0])] = item
         genre_film_norms[gid] = (gname, gmap)
-        reg.add(f"mov-genre-{gid}", f"Name a {gname} movie", "movies", build_balanced_tiers(items))
+        if reg.add(f"mov-genre-{gid}", f"Name a {gname} movie", "movies", build_balanced_tiers(items, MAX_SEED_ANSWERS)):
+            added += 1
         add_letter_slices(rows, f"mov-genre-{gid}", f"Name a {gname} movie starting with the letter {{L}}", "movies")
 
-    # Deepen mov-90s-comedy and generate Genre x Decade intersections (zero network!)
     if "1990s" in decade_film_norms and "comedy" in genre_film_norms:
         d90 = decade_film_norms["1990s"]
         gcom = genre_film_norms["comedy"][1]
@@ -848,288 +1339,177 @@ SELECT ?itemLabel ?sitelinks WHERE {{
                 ):
                     added += 1
 
-    # Films by country
-    film_countries = [
-        ("france", "Q142", "French"),
-        ("japan", "Q17", "Japanese"),
-        ("uk", "Q145", "British"),
-        ("italy", "Q38", "Italian"),
-        ("germany", "Q183", "German"),
-        ("india", "Q668", "Indian"),
-        ("korea", "Q884", "South Korean"),
-        ("spain", "Q29", "Spanish"),
-        ("canada", "Q16", "Canadian"),
-        ("australia", "Q408", "Australian"),
-        ("sweden", "Q34", "Swedish"),
-        ("mexico", "Q96", "Mexican"),
-        ("china", "Q148", "Chinese"),
-        ("russia", "Q159", "Russian"),
-        ("brazil", "Q155", "Brazilian"),
-    ]
-    for cid, qid, adj in film_countries:
-        q = f"""
-SELECT ?itemLabel ?sitelinks WHERE {{
-  ?item wdt:P31 wd:Q11424 .
-  ?item wdt:P495 wd:{qid} .
-  ?item wikibase:sitelinks ?sitelinks .
-  FILTER(?sitelinks >= 10)
-  SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en". }}
-}} ORDER BY DESC(?sitelinks) LIMIT 1600"""
-        rows = run_sparql_rows(f"film_country_{cid}", q)
-        items = [(c[0], float(r.get("sitelinks", 1) or 1), c[1]) for r in rows if (c := clean_label(r["itemLabel"]))]
-        reg.add(f"mov-country-{cid}", f"Name a {adj} movie", "movies", build_balanced_tiers(items))
+    for cid, _qid, adj in FILM_COUNTRIES:
+        rows = datasets.get(f"film_country_{cid}", [])
+        items = rows_to_scored_items(rows, alias_map)
+        if reg.add(f"mov-country-{cid}", f"Name a {adj} movie", "movies", build_balanced_tiers(items, MAX_SEED_ANSWERS)):
+            added += 1
         add_letter_slices(rows, f"mov-country-{cid}", f"Name a {adj} movie starting with the letter {{L}}", "movies")
 
-    # 3. TV Series (fixed Q5398426!), Anime, Manga, Songs, Video Game genres, Fictional Characters
-    tv_q = """
-SELECT ?itemLabel ?sitelinks WHERE {
-  ?item wdt:P31 wd:Q5398426 .
-  ?item wikibase:sitelinks ?sitelinks .
-  FILTER(?sitelinks >= 14)
-  SERVICE wikibase:label { bd:serviceParam wikibase:language "en". }
-} ORDER BY DESC(?sitelinks) LIMIT 2800"""
-    tv_rows = run_sparql_rows("tv_series_v2", tv_q)
-    tv_items = [(c[0], float(r.get("sitelinks", 1) or 1), c[1]) for r in tv_rows if (c := clean_label(r["itemLabel"]))]
-    reg.add("gen-tv-show", "Name a TV show or series", "general", build_balanced_tiers(tv_items, MAX_SEED_ANSWERS))
+    # 4. TV Series, Anime, Manga, Songs, Video Games + subgenres
+    tv_rows = datasets.get("tv_series_v2", [])
+    if reg.add("gen-tv-show", "Name a TV show or series", "general", build_balanced_tiers(rows_to_scored_items(tv_rows, alias_map), MAX_SEED_ANSWERS)):
+        added += 1
     add_letter_slices(tv_rows, "gen-tv", "Name a TV show starting with the letter {L}", "general")
 
-    # TV series by country
-    for code, qid, adj in [
-        ("us", "Q30", "American"),
-        ("uk", "Q145", "British"),
-        ("jp", "Q17", "Japanese"),
-        ("kr", "Q884", "South Korean"),
-        ("ca", "Q16", "Canadian"),
-    ]:
-        q = f"""
-SELECT ?itemLabel ?sitelinks WHERE {{
-  ?item wdt:P31 wd:Q5398426 .
-  ?item wdt:P495 wd:{qid} .
-  ?item wikibase:sitelinks ?sitelinks .
-  FILTER(?sitelinks >= 12)
-  SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en". }}
-}} ORDER BY DESC(?sitelinks) LIMIT 1600"""
-        rows = run_sparql_rows(f"tv_{code}", q)
-        items = [(c[0], float(r.get("sitelinks", 1) or 1), c[1]) for r in rows if (c := clean_label(r["itemLabel"]))]
-        reg.add(f"gen-tv-{code}", f"Name a {adj} TV show", "general", build_balanced_tiers(items))
+    for code, _qid, adj in TV_COUNTRIES:
+        rows = datasets.get(f"tv_{code}", [])
+        if reg.add(f"gen-tv-{code}", f"Name a {adj} TV show", "general", build_balanced_tiers(rows_to_scored_items(rows, alias_map), MAX_SEED_ANSWERS)):
+            added += 1
 
-    # Anime & Manga
-    anime_q = """
-SELECT ?itemLabel ?sitelinks WHERE {
-  ?item wdt:P31 wd:Q63952888 .
-  ?item wikibase:sitelinks ?sitelinks .
-  FILTER(?sitelinks >= 8)
-  SERVICE wikibase:label { bd:serviceParam wikibase:language "en". }
-} ORDER BY DESC(?sitelinks) LIMIT 1800"""
-    anime_rows = run_sparql_rows("anime_series", anime_q)
-    anime_items = [(c[0], float(r.get("sitelinks", 1) or 1), c[1]) for r in anime_rows if (c := clean_label(r["itemLabel"]))]
-    reg.add("gen-anime", "Name an anime series", "general", build_balanced_tiers(anime_items, MAX_SEED_ANSWERS))
+    anime_rows = datasets.get("anime_series", [])
+    if reg.add("gen-anime", "Name an anime series", "general", build_balanced_tiers(rows_to_scored_items(anime_rows, alias_map), MAX_SEED_ANSWERS)):
+        added += 1
     add_letter_slices(anime_rows, "gen-anime", "Name an anime series starting with the letter {L}", "general")
 
-    manga_q = """
-SELECT ?itemLabel ?sitelinks WHERE {
-  ?item wdt:P31 wd:Q21198342 .
-  ?item wikibase:sitelinks ?sitelinks .
-  FILTER(?sitelinks >= 8)
-  SERVICE wikibase:label { bd:serviceParam wikibase:language "en". }
-} ORDER BY DESC(?sitelinks) LIMIT 1800"""
-    manga_rows = run_sparql_rows("manga_series", manga_q)
-    manga_items = [(c[0], float(r.get("sitelinks", 1) or 1), c[1]) for r in manga_rows if (c := clean_label(r["itemLabel"]))]
-    reg.add("gen-manga", "Name a manga series", "general", build_balanced_tiers(manga_items, MAX_SEED_ANSWERS))
+    manga_rows = datasets.get("manga_series", [])
+    if reg.add("gen-manga", "Name a manga series", "general", build_balanced_tiers(rows_to_scored_items(manga_rows, alias_map), MAX_SEED_ANSWERS)):
+        added += 1
     add_letter_slices(manga_rows, "gen-manga", "Name a manga series starting with the letter {L}", "general")
 
-    # Hit Singles / Songs
-    songs_q = """
-SELECT ?itemLabel ?sitelinks WHERE {
-  ?item wdt:P31 wd:Q134556 .
-  ?item wikibase:sitelinks ?sitelinks .
-  FILTER(?sitelinks >= 18)
-  SERVICE wikibase:label { bd:serviceParam wikibase:language "en". }
-} ORDER BY DESC(?sitelinks) LIMIT 2600"""
-    song_rows = run_sparql_rows("hit_songs", songs_q)
-    song_items = [(c[0], float(r.get("sitelinks", 1) or 1), c[1]) for r in song_rows if (c := clean_label(r["itemLabel"]))]
-    reg.add("gen-song", "Name a famous song or single", "general", build_balanced_tiers(song_items, MAX_SEED_ANSWERS))
+    song_rows = datasets.get("hit_songs", [])
+    if reg.add("gen-song", "Name a famous song or single", "general", build_balanced_tiers(rows_to_scored_items(song_rows, alias_map), MAX_SEED_ANSWERS)):
+        added += 1
     add_letter_slices(song_rows, "gen-song", "Name a famous song starting with the letter {L}", "general")
 
-    # Video games + subgenres
-    vg_q = """
-SELECT ?itemLabel ?sitelinks WHERE {
-  ?item wdt:P31 wd:Q7889 .
-  ?item wikibase:sitelinks ?sitelinks .
-  FILTER(?sitelinks >= 16)
-  SERVICE wikibase:label { bd:serviceParam wikibase:language "en". }
-} ORDER BY DESC(?sitelinks) LIMIT 2800"""
-    vg_rows = run_sparql_rows("video_games", vg_q)
-    vg_items = [(c[0], float(r.get("sitelinks", 1) or 1), c[1]) for r in vg_rows if (c := clean_label(r["itemLabel"]))]
-    reg.add("gen-video-game", "Name a video game", "general", build_balanced_tiers(vg_items, MAX_SEED_ANSWERS))
+    vg_rows = datasets.get("video_games", [])
+    if reg.add("gen-video-game", "Name a video game", "general", build_balanced_tiers(rows_to_scored_items(vg_rows, alias_map), MAX_SEED_ANSWERS)):
+        added += 1
     add_letter_slices(vg_rows, "gen-vg", "Name a video game starting with the letter {L}", "general")
 
-    vg_genres = [
-        ("rpg", "Q744038", "role-playing (RPG)"),
-        ("fps", "Q185029", "first-person shooter"),
-        ("platformer", "Q828322", "platformer"),
-        ("strategy", "Q472285", "strategy"),
-        ("racing", "Q860750", "racing"),
-        ("fighting", "Q744038", "fighting"),
-        ("horror", "Q223251", "survival horror"),
-    ]
-    vg_genres[5] = ("fighting", "Q343568", "fighting")
-    for gid, qid, gname in vg_genres:
-        q = f"""
-SELECT ?itemLabel ?sitelinks WHERE {{
-  ?item wdt:P31 wd:Q7889 .
-  ?item wdt:P136 wd:{qid} .
-  ?item wikibase:sitelinks ?sitelinks .
-  FILTER(?sitelinks >= 10)
-  SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en". }}
-}} ORDER BY DESC(?sitelinks) LIMIT 1200"""
-        rows = run_sparql_rows(f"vg_genre_{gid}", q)
-        items = [(c[0], float(r.get("sitelinks", 1) or 1), c[1]) for r in rows if (c := clean_label(r["itemLabel"]))]
-        reg.add(f"gen-vg-{gid}", f"Name a {gname} video game", "general", build_balanced_tiers(items))
+    for gid, gname in [
+        ("rpg", "role-playing (RPG)"),
+        ("fps", "first-person shooter"),
+        ("platformer", "platformer"),
+        ("strategy", "strategy"),
+        ("racing", "racing"),
+        ("fighting", "fighting"),
+        ("horror", "survival horror"),
+    ]:
+        rows = datasets.get(f"vg_genre_{gid}", [])
+        if reg.add(f"gen-vg-{gid}", f"Name a {gname} video game", "general", build_balanced_tiers(rows_to_scored_items(rows, alias_map), MAX_SEED_ANSWERS)):
+            added += 1
 
-    # 4. Master lists: Literature, Arts, Music, History, Science, Nature, Tech, Sports
-    master_lists = [
-        ("books", "Q7725634", "P31", 15, "gen-book", "Name a famous book or novel", "general"),
-        ("actors", "Q33999", "P106", 35, "mov-actor", "Name a film or TV actor", "movies"),
-        ("painters", "Q1028181", "P106", 20, "gen-painter", "Name a famous painter or artist", "general"),
-        ("bands", "Q215380", "P31", 22, "gen-band", "Name a musical band or group", "general"),
-        ("singers", "Q177220", "P106", 32, "gen-singer", "Name a singer or vocalist", "general"),
-        ("albums", "Q482994", "P31", 16, "gen-album", "Name a studio album", "general"),
-        ("languages", "Q34770", "P31", 15, "gen-language", "Name a world language", "general"),
-        ("universities", "Q3918", "P31", 25, "gen-university", "Name a university or college", "general"),
-        ("museums", "Q33506", "P31", 14, "gen-museum", "Name a museum", "general"),
-        ("castles", "Q23413", "P31", 10, "gen-castle", "Name a castle or palace", "general"),
-        ("airlines", "Q46970", "P31", 10, "gen-airline", "Name an airline", "general"),
-        ("airports", "Q1248784", "P31", 18, "geo-airport", "Name an international airport", "geography"),
-        ("battles", "Q178561", "P31", 18, "gen-battle", "Name a historical battle", "general"),
-        ("wars", "Q198", "P31", 18, "gen-war", "Name a historical war or conflict", "general"),
-        ("dishes", "Q746549", "P31", 6, "gen-dish", "Name a traditional dish or food", "general"),
-        ("football_clubs", "Q476028", "P31", 20, "spt-football-club", "Name a football (soccer) club", "sports"),
-        ("nba_players", "Q3665646", "P106", 20, "spt-nba-player", "Name a basketball player", "sports"),
-        ("baseball_players", "Q10871364", "P106", 22, "spt-mlb-player", "Name a baseball player", "sports"),
-        ("f1_drivers", "Q10841764", "P106", 12, "spt-f1-driver", "Name a Formula 1 driver", "sports"),
-        ("boxers", "Q11338576", "P106", 15, "spt-boxer", "Name a boxer", "sports"),
-        ("chess_players", "Q10873124", "P106", 12, "spt-chess-player", "Name a chess grandmaster or player", "sports"),
-        # New rich non-pop-culture categories:
-        ("golfers_v2", "Q490253", "P106", 10, "spt-golfer", "Name a professional golfer", "sports"),
-        ("nfl_players", "Q19204627", "P106", 16, "spt-nfl-player", "Name an American football (NFL) player", "sports"),
-        ("nhl_players", "Q11774891", "P106", 16, "spt-nhl-player", "Name an ice hockey (NHL) player", "sports"),
-        ("swimmers", "Q10843402", "P106", 12, "spt-swimmer", "Name a competitive swimmer", "sports"),
-        ("cyclists", "Q2309784", "P106", 15, "spt-cyclist", "Name a professional cyclist", "sports"),
-        ("cricketers", "Q12299841", "P106", 12, "spt-cricketer", "Name a cricketer", "sports"),
-        ("philosophers", "Q4964182", "P106", 20, "gen-philosopher", "Name a philosopher", "general"),
-        ("architects", "Q42973", "P106", 16, "gen-architect", "Name a famous architect", "general"),
-        ("inventors", "Q205375", "P106", 15, "gen-inventor", "Name an inventor", "general"),
-        ("explorers", "Q11900058", "P106", 12, "gen-explorer", "Name a famous explorer", "general"),
-        ("monarchs", "Q116", "P39", 22, "gen-monarch", "Name a monarch, king, or queen", "general"),
-        ("companies", "Q4830453", "P31", 28, "gen-company", "Name a well-known company or corporation", "general"),
-        ("websites", "Q35127", "P31", 16, "gen-website", "Name a website or online platform", "general"),
-        ("spacecraft", "Q40218", "P31", 12, "gen-spacecraft", "Name a spacecraft or space probe", "general"),
-        ("stars", "Q523", "P31", 12, "gen-star", "Name a star in the night sky", "general"),
-        ("compounds", "Q11173", "P31", 28, "gen-compound", "Name a chemical compound or molecule", "general"),
-        ("diseases", "Q12136", "P31", 20, "gen-disease", "Name a medical disease or condition", "general"),
-        ("cat_breeds", "Q43577", "P31", 2, "gen-cat-breed", "Name a cat breed", "general"),
-        ("horse_breeds", "Q23002039", "P31", 2, "gen-horse-breed", "Name a horse breed", "general"),
-        ("breads", "Q7802", "P31", 2, "gen-bread", "Name a type of bread", "general"),
-        ("soups", "Q41415", "P31", 2, "gen-soup", "Name a soup or stew", "general"),
-        ("sauces", "Q178359", "P31", 2, "gen-sauce", "Name a sauce or condiment", "general"),
-        ("pastries", "Q477248", "P31", 2, "gen-pastry", "Name a pastry or baked sweet", "general"),
-        ("wine_grapes", "Q10978", "P31", 3, "gen-grape", "Name a wine grape variety", "general"),
-        ("comics_chars", "Q1114461", "P31", 8, "gen-comic-char", "Name a comic book character", "general"),
-        ("skyscrapers", "Q11303", "P31", 8, "geo-skyscraper", "Name a skyscraper or tall tower", "geography"),
-        ("glaciers", "Q35666", "P31", 4, "geo-glacier", "Name a glacier", "geography"),
-        ("caves", "Q35509", "P31", 5, "geo-cave", "Name a cave or cavern", "geography"),
-        ("canyons", "Q150784", "P31", 3, "geo-canyon", "Name a canyon or gorge", "geography"),
-        ("bays", "Q39594", "P31", 6, "geo-bay", "Name a bay or gulf", "geography"),
-        ("capes", "Q185113", "P31", 5, "geo-cape", "Name a cape or headland", "geography"),
-        ("nobel_laureates", "Q7191", "P166", 20, "gen-nobel", "Name a Nobel Prize laureate", "general"),
-    ]
-
-    for key, qid, prop, min_sl, pid, ptext, cat in master_lists:
-        q = f"""
-SELECT ?itemLabel ?sitelinks WHERE {{
-  ?item wdt:{prop} wd:{qid} .
-  ?item wikibase:sitelinks ?sitelinks .
-  FILTER(?sitelinks >= {min_sl})
-  SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en". }}
-}} ORDER BY DESC(?sitelinks) LIMIT 2600"""
-        rows = run_sparql_rows(key, q)
-        items = [(c[0], float(r.get("sitelinks", 1) or 1), c[1]) for r in rows if (c := clean_label(r["itemLabel"]))]
-        reg.add(pid, ptext, cat, build_balanced_tiers(items, MAX_SEED_ANSWERS))
+    # 5. Master lists
+    for key, _where_b, _min_sl, _lim, pid, ptext, cat, _fb_sl in MASTER_LISTS:
+        rows = datasets.get(key, [])
+        items = rows_to_scored_items(rows, alias_map)
+        if reg.add(pid, ptext, cat, build_balanced_tiers(items, MAX_SEED_ANSWERS)):
+            added += 1
         add_letter_slices(rows, pid, f"{ptext} starting with the letter {{L}}", cat)
 
-    # Footballers fast query (sitelinks >= 48)
-    fb_q = """
-SELECT ?itemLabel ?sitelinks WHERE {
-  ?item wdt:P106 wd:Q937857 .
-  ?item wikibase:sitelinks ?sitelinks .
-  FILTER(?sitelinks >= 48)
-  SERVICE wikibase:label { bd:serviceParam wikibase:language "en". }
-} ORDER BY DESC(?sitelinks) LIMIT 2400"""
-    fb_rows = run_sparql_rows("footballers_v2", fb_q)
-    fb_items = [(c[0], float(r.get("sitelinks", 1) or 1), c[1]) for r in fb_rows if (c := clean_label(r["itemLabel"]))]
-    reg.add("spt-footballer", "Name a professional footballer (soccer player)", "sports", build_balanced_tiers(fb_items, MAX_SEED_ANSWERS))
+    # 6. Footballers & animal species
+    fb_rows = datasets.get("footballers_v2", [])
+    if reg.add("spt-footballer", "Name a professional footballer (soccer player)", "sports", build_balanced_tiers(rows_to_scored_items(fb_rows, alias_map), MAX_SEED_ANSWERS)):
+        added += 1
     add_letter_slices(fb_rows, "spt-footballer", "Name a footballer starting with the letter {L}", "sports")
 
-    # Vertebrate & animal common names via P1843 (higher sitelink floor so SPARQL stays fast)
-    animal_classes = [
-        ("mammals_en", "Q7377", "gen-mammal", "Name a mammal species", "general"),
-        ("birds_en", "Q5113", "gen-bird", "Name a bird species", "general"),
-        ("reptiles_en", "Q10811", "gen-reptile", "Name a reptile species", "general"),
-        ("fishes_en", "Q152", "gen-fish", "Name a fish species", "general"),
-    ]
-    for key, qid, pid, ptext, cat in animal_classes:
-        q = f"""
-SELECT ?itemLabel ?sitelinks WHERE {{
-  ?item wdt:P1843 ?common .
-  FILTER(LANG(?common) = "en")
-  ?item wdt:P105 wd:Q7432 .
-  ?item wdt:P171* wd:{qid} .
-  ?item wikibase:sitelinks ?sitelinks .
-  FILTER(?sitelinks >= 30)
-  SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en". }}
-}} ORDER BY DESC(?sitelinks) LIMIT 900"""
-        rows = run_sparql_rows(key, q)
-        items = [(c[0], float(r.get("sitelinks", 1) or 1), c[1]) for r in rows if (c := clean_label(r["itemLabel"]))]
-        reg.add(pid, ptext, cat, build_balanced_tiers(items, MAX_SEED_ANSWERS))
+    for key, pid, ptext, cat in [
+        ("mammals_en", "gen-mammal", "Name a mammal species", "general"),
+        ("birds_en", "gen-bird", "Name a bird species", "general"),
+        ("reptiles_en", "gen-reptile", "Name a reptile species", "general"),
+        ("fishes_en", "gen-fish", "Name a fish species", "general"),
+    ]:
+        rows = datasets.get(key, [])
+        if reg.add(pid, ptext, cat, build_balanced_tiers(rows_to_scored_items(rows, alias_map), MAX_SEED_ANSWERS)):
+            added += 1
         add_letter_slices(rows, pid, f"{ptext} starting with the letter {{L}}", cat)
 
-    # People & places by country
-    people_country_queries = [
-        ("authors_country", "Q36180", "P106", "P27", 22, "gen-author-nat", "Name an author from {G}", "general"),
-        ("bands_country", "Q215380", "P31", "P495", 16, "gen-band-nat", "Name a band from {G}", "general"),
-        ("clubs_country", "Q476028", "P31", "P17", 15, "spt-club-nat", "Name a football club in {G}", "sports"),
-        ("stadiums_country", "Q483110", "P31", "P17", 8, "spt-stad-nat", "Name a sports stadium in {G}", "sports"),
-        ("islands_country", "Q23442", "P31", "P17", 8, "geo-isl-nat", "Name an island in {G}", "geography"),
-        ("lakes_country", "Q23397", "P31", "P17", 8, "geo-lak-nat", "Name a lake in {G}", "geography"),
-        ("parks_country", "Q46169", "P31", "P17", 4, "geo-prk-nat", "Name a national park in {G}", "geography"),
-        ("unesco_country", "Q9259", "P1435", "P17", 5, "geo-her-nat", "Name a World Heritage Site in {G}", "geography"),
-        ("dishes_country", "Q746549", "P31", "P495", 3, "gen-dish-nat", "Name a traditional food or dish from {G}", "general"),
-        ("universities_country", "Q3918", "P31", "P17", 18, "gen-uni-nat", "Name a university in {G}", "general"),
-        ("museums_country", "Q33506", "P31", "P17", 10, "gen-mus-nat", "Name a museum in {G}", "general"),
-        ("castles_country", "Q23413", "P31", "P17", 6, "gen-cas-nat", "Name a castle or palace in {G}", "general"),
-    ]
-    for key, qid, prop, grp_prop, min_sl, id_pref, fmt, cat in people_country_queries:
-        q = f"""
-SELECT ?itemLabel ?grpLabel ?sitelinks WHERE {{
-  ?item wdt:{prop} wd:{qid} .
-  ?item wdt:{grp_prop} ?grp .
-  ?item wikibase:sitelinks ?sitelinks .
-  FILTER(?sitelinks >= {min_sl})
-  SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en". }}
-}} ORDER BY DESC(?sitelinks) LIMIT 3200"""
-        rows = run_sparql_rows(key, q)
+    # 7. People & places by country
+    for key, _qid, _prop, _grp_prop, _min_sl, id_pref, fmt, cat in PEOPLE_COUNTRY_QUERIES:
+        rows = datasets.get(key, [])
         add_group_slices(rows, "grpLabel", id_pref, fmt, cat)
         if key == "authors_country":
-            author_items = [
-                (c[0], float(r.get("sitelinks", 1) or 1), c[1])
-                for r in rows
-                if (c := clean_label(r["itemLabel"]))
-            ]
-            reg.add("gen-author", "Name an author or writer", "general", build_balanced_tiers(author_items, MAX_SEED_ANSWERS))
+            author_items = rows_to_scored_items(rows, alias_map)
+            if reg.add("gen-author", "Name an author or writer", "general", build_balanced_tiers(author_items, MAX_SEED_ANSWERS)):
+                added += 1
             add_letter_slices(rows, "gen-author", "Name an author or writer starting with the letter {L}", "general")
 
     return added
+
+
+def enrich_remaining_prompts_with_aliases(
+    reg: PromptRegistry,
+    datasets: dict[str, list[dict[str, str]]],
+    alias_map: dict[str, list[str]],
+) -> int:
+    """Attach clean Wikidata aliases by normalized canonical label on non-words prompts without collisions."""
+    label_best: dict[str, tuple[float, list[str]]] = {}
+    for rows in datasets.values():
+        for r in rows:
+            qid = r.get("qid")
+            if not qid or qid not in alias_map or not alias_map[qid]:
+                continue
+            cleaned = clean_label(r["itemLabel"])
+            if not cleaned:
+                continue
+            canon, base_als = cleaned
+            cnorm = normalize_answer(canon)
+            if not cnorm:
+                continue
+            sl = float(r.get("sitelinks", 1) or 1)
+            prev = label_best.get(cnorm)
+            als = clean_wikidata_aliases(canon, [*base_als, *alias_map[qid]])
+            if not als:
+                continue
+            if prev is None or sl > prev[0]:
+                label_best[cnorm] = (sl, als)
+
+    attached_count = 0
+    for prompt in reg.prompts:
+        if prompt["category"] == "words":
+            continue
+        tiers_map = prompt["tiers"]
+        seen_norms: dict[str, str] = {}
+        for t in TIERS:
+            for item in tiers_map[t]:
+                forms = [item] if isinstance(item, str) else item
+                for form in forms:
+                    fn = normalize_answer(form)
+                    if fn:
+                        for v in plural_variants(fn):
+                            seen_norms.setdefault(v, t)
+
+        for t in TIERS:
+            updated_list: list[Any] = []
+            for item in tiers_map[t]:
+                if isinstance(item, str):
+                    canon, existing_als = item, []
+                else:
+                    canon, existing_als = item[0], list(item[1:])
+                cnorm = normalize_answer(canon)
+                cand_info = label_best.get(cnorm)
+                if not cand_info:
+                    updated_list.append(item)
+                    continue
+                extra_als = clean_wikidata_aliases(canon, [*existing_als, *cand_info[1]])
+                existing_set = {normalize_answer(a) for a in existing_als}
+                final_als = list(existing_als)
+                added_here = False
+                for al in extra_als:
+                    if len(final_als) >= MAX_ALIASES_PER_ENTRY:
+                        break
+                    anorm = normalize_answer(al)
+                    if not anorm or anorm in existing_set:
+                        continue
+                    avars = plural_variants(anorm)
+                    if any(v in seen_norms for v in avars):
+                        continue
+                    for v in avars:
+                        seen_norms[v] = t
+                    existing_set.add(anorm)
+                    final_als.append(al)
+                    added_here = True
+                    attached_count += 1
+                if final_als and added_here:
+                    updated_list.append([canon, *final_als])
+                elif existing_als:
+                    updated_list.append(item)
+                else:
+                    updated_list.append(canon)
+            tiers_map[t] = updated_list
+
+    return attached_count
 
 
 def load_word_frequencies() -> dict[str, int]:
@@ -1369,19 +1749,33 @@ def main() -> None:
     load_seed_and_existing(reg)
     print(f"   Loaded {len(reg.prompts)} prompts.")
 
-    print("2. Deepening islands & archipelagos (Bonaire, Aruba, Curacao, territories)...")
-    deepen_islands_and_archipelagos(reg)
+    print("2. Fetching master_v2 Wikidata datasets (fixed QIDs, broadened P31s, raised limits)...")
+    datasets = fetch_all_master_v2_queries()
+    all_qids: set[str] = {
+        r["qid"] for rows in datasets.values() for r in rows if r.get("qid")
+    }
+    print(f"   Collected {len(datasets)} datasets covering {len(all_qids):,} unique Wikidata QIDs.")
+
+    print("3. Fetching batched English skos:altLabel aliases from Wikidata...")
+    alias_map = fetch_wikidata_aliases(all_qids)
+
+    print("4. Deepening islands & archipelagos (Bonaire, Aruba, Curacao, territories + aliases)...")
+    deepen_islands_and_archipelagos(reg, datasets, alias_map)
     print(f"   geo-island: {reg.by_id['geo-island']['answerCount']}, geo-archipelago: {reg.by_id['geo-archipelago']['answerCount']}")
 
-    print("3. Fetching & slicing master Wikidata datasets (TV, anime, manga, songs, movies, cities, science, sports)...")
-    n_wd = enrich_from_master_wikidata(reg)
+    print("5. Assembling master_v2 Wikidata prompts & upgrades...")
+    n_wd = assemble_master_prompts(reg, datasets, alias_map)
     print(f"   Added {n_wd} Wikidata faceted prompts (total: {len(reg.prompts)}).")
 
-    print("4. Slicing large core prompts by starting letter (after island/movie deepening)...")
+    print("6. Enriching remaining non-words seed prompts with Wikidata aliases...")
+    n_extra_als = enrich_remaining_prompts_with_aliases(reg, datasets, alias_map)
+    print(f"   Attached {n_extra_als:,} extra aliases across remaining seed prompts.")
+
+    print("7. Slicing large core prompts by starting letter (after deepening + aliases)...")
     n_sliced = slice_existing_prompts(reg)
     print(f"   Added {n_sliced} letter-slice prompts (total: {len(reg.prompts)}).")
 
-    print("5. Generating dictionary wordcraft prompts...")
+    print("8. Generating dictionary wordcraft prompts...")
     dict_scored = load_english_dictionary()
     n_words = generate_wordcraft_prompts(reg, dict_scored)
     print(f"   Added {n_words} wordcraft prompts (total: {len(reg.prompts)}).")
@@ -1395,6 +1789,7 @@ def main() -> None:
     chunks: list[dict[str, Any]] = [{} for _ in range(NUM_CHUNKS)]
     manifest_entries: list[dict[str, Any]] = []
     total_answers = 0
+    total_aliases = 0
 
     for p in reg.prompts:
         cid = chunk_index_for_id(p["id"])
@@ -1409,12 +1804,17 @@ def main() -> None:
             }
         )
         total_answers += p["answerCount"]
+        for t in TIERS:
+            for item in p["tiers"][t]:
+                if isinstance(item, list):
+                    total_aliases += len(item) - 1
 
+    max_chunk_bytes = 0
     for cid, payload in enumerate(chunks):
         chunk_path = OUT_CHUNKS_DIR / f"chunk-{cid:03d}.json"
-        chunk_path.write_text(
-            json.dumps(payload, separators=(",", ":")), encoding="utf-8"
-        )
+        raw_text = json.dumps(payload, separators=(",", ":"))
+        chunk_path.write_text(raw_text, encoding="utf-8")
+        max_chunk_bytes = max(max_chunk_bytes, len(raw_text.encode("utf-8")))
 
     packs_meta = [
         ("words", "WORDS & LANGUAGE", "English quirks, loanwords, and lettercraft", "chapters", "#38bdf8",
@@ -1477,7 +1877,14 @@ def main() -> None:
     print(f"Total prompts: {len(manifest_entries):,} ({year_days} non-repeating daily dives!)")
     print(f"By category: {dict(cat_counts)}")
     print(f"Pop-culture share: {pop_count:,} / {len(manifest_entries):,} ({pop_count / len(manifest_entries) * 100:.1f}%)")
-    print(f"Total answers: {total_answers:,}")
+    print(f"Total answers: {total_answers:,} (+ {total_aliases:,} aliases)")
+    print(f"Max chunk size: {max_chunk_bytes / 1024:.1f} KB across {NUM_CHUNKS} chunks")
+    for check_pid in [
+        "gen-nobel", "gen-compound", "gen-grape", "gen-vg-strategy", "gen-vg-horror",
+        "gen-fish", "mov-decade-1950s", "geo-island", "geo-city-am-brazil", "geo-city-am-usa",
+    ]:
+        p = reg.by_id.get(check_pid)
+        print(f"  [Check] {check_pid}: {p['answerCount'] if p else 'MISSING'}")
 
 
 if __name__ == "__main__":
