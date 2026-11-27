@@ -1,5 +1,5 @@
 /**
- * Owns public exports for the prompt manifest, themed packs, and static SQLite repository.
+ * Owns public exports for the prompt manifest, themed packs, and zero-Range static shard repository.
  * Does not execute direct DOM operations or manage gameplay state.
  */
 export {
@@ -10,9 +10,11 @@ export {
 } from './manifest';
 export {
   PROMPT_META_BY_ID,
+  clearRepositoryCacheForTests,
   loadPromptTierSamples,
   matchPromptAnswerRemote,
+  prefetchPrompts,
   searchPromptAnswers,
-  warmupDatabase,
+  setJsonFetcherForTests,
+  type JsonFetcher,
 } from './promptRepository';
-export { setQueryExecutorForTests, type QueryExecutor } from './sqliteDb';

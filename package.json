@@ -13,8 +13,7 @@
     "@fontsource/ibm-plex-mono": "^5.2.7",
     "@fontsource/silkscreen": "^5.2.6",
     "react": "^19.1.0",
-    "react-dom": "^19.1.0",
-    "sql.js-httpvfs": "^0.8.12"
+    "react-dom": "^19.1.0"
   },
   "devDependencies": {
     "@types/react": "^19.1.2",

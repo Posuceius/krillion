@@ -1850,40 +1850,8 @@ def write_sqlite_and_chunks(reg: PromptRegistry) -> tuple[int, int, int]:
     conn.close()
 
     db_size = SQLITE_OUT_PATH.stat().st_size
-    print(f"  [SQLite] Final database size: {db_size / (1024 * 1024):.2f} MiB ({db_size:,} bytes)")
-    if db_size > MAX_DB_BYTES:
-        raise RuntimeError(f"SQLite size {db_size} exceeds {MAX_DB_BYTES} limit!")
-
-    # Remove old JSON chunks/prompts & write 10 MiB static DB chunks + config.json
-    if OLD_CHUNKS_DIR.exists():
-        shutil.rmtree(OLD_CHUNKS_DIR)
-    if OLD_PROMPTS_DIR.exists():
-        shutil.rmtree(OLD_PROMPTS_DIR)
-
-    OUT_DB_DIR.mkdir(parents=True, exist_ok=True)
-    for old_part in OUT_DB_DIR.glob("krillion.sqlite3.*"):
-        old_part.unlink()
-
-    num_parts = 0
-    with SQLITE_OUT_PATH.open("rb") as src_fh:
-        while True:
-            buf = src_fh.read(CHUNK_BYTES)
-            if not buf:
-                break
-            part_path = OUT_DB_DIR / f"krillion.sqlite3.{num_parts:03d}"
-            part_path.write_bytes(buf)
-            num_parts += 1
-
-    cfg = {
-        "serverMode": "chunked",
-        "requestChunkSize": 4096,
-        "databaseLengthBytes": db_size,
-        "serverChunkSize": CHUNK_BYTES,
-        "urlPrefix": "krillion.sqlite3.",
-        "suffixLength": 3,
-    }
-    (OUT_DB_DIR / "config.json").write_text(json.dumps(cfg, indent=2), encoding="utf-8")
-    return db_size, num_parts, len(forms_dict)
+    print(f"  [SQLite] Cached database size: {db_size / (1024 * 1024):.2f} MiB ({db_size:,} bytes)")
+    return db_size, len(forms_dict)
 
 
 def write_manifest_and_packs(reg: PromptRegistry, total_answers: int) -> tuple[int, int]:
@@ -1979,18 +1947,25 @@ def main() -> None:
     run_wikidata_batches_and_broad(reg)
     print(f"   Total broad prompts assembled: {len(reg.prompts)}")
 
-    print("6. Building indexed SQLite DB and splitting into 10 MiB static HTTP chunks...")
+    print("6. Building local SQLite cache and exporting Zero-Range Hybrid Static Shards...")
     total_answers = sum(p["answerCount"] for p in reg.prompts)
-    db_size, num_parts, total_forms = write_sqlite_and_chunks(reg)
-    daily_eligible, year_days = write_manifest_and_packs(reg, total_answers)
+    db_size, total_forms = write_sqlite_and_chunks(reg)
+    from export_static_shards import export_from_sqlite
+
+    shard_stats = export_from_sqlite(SQLITE_OUT_PATH)
+    daily_eligible = shard_stats["daily_eligible"]
+    year_days = shard_stats["year_days"]
 
     cat_counts = Counter(p["category"] for p in reg.prompts if not p.get("packOnly"))
-    print("\n=== SQLITE DATABASE v1.3.0 COMPLETE ===")
+    print("\n=== KRILLION ZERO-RANGE BUILD COMPLETE ===")
     print(f"Elapsed: {time.time() - t0:.1f}s")
     print(f"Total prompts: {len(reg.prompts):,} ({daily_eligible:,} daily-eligible -> {year_days} non-repeating days!)")
     print(f"Daily-eligible by category: {dict(cat_counts)}")
     print(f"Total prompt-answer links: {total_answers:,} | Total searchable normalized forms: {total_forms:,}")
-    print(f"SQLite size: {db_size / (1024 * 1024):.2f} MiB across {num_parts} chunk files under public/data/db/")
+    print(
+        f"Cached SQLite: {db_size / (1024 * 1024):.2f} MiB | "
+        f"Static JSON shards: {shard_stats['total_raw_mib']:.2f} MiB across {shard_stats['total_files']} files"
+    )
     for pid in ["geo-world-city", "mov-any-movie", "gen-tv-show", "geo-island", "geo-river", "geo-mountain", "gen-song", "gen-band", "gen-book", "gen-video-game", "mov-director", "gen-composer", "spt-footballer", "geo-city-am-usa"]:
         p = reg.by_id.get(pid)
         print(f"  [MegaCheck] {pid}: {p['answerCount'] if p else 'MISSING':,}")

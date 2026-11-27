@@ -20,7 +20,7 @@ import {
   PROMPT_MANIFEST,
   PROMPT_META_BY_ID,
   TOTAL_ANSWER_COUNT,
-  warmupDatabase,
+  prefetchPrompts,
 } from './data';
 import {
   dateStringFromDiveNumber,
@@ -180,7 +180,7 @@ export function App() {
         if (!meta) throw new Error(`Unknown prompt id: ${id}`);
         return meta;
       });
-      await warmupDatabase();
+      await prefetchPrompts(prompts);
       setCanvasDepth(targetDepth);
       setActiveSession({
         ...sessionBase,

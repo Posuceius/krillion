@@ -1,6 +1,6 @@
 /**
- * Owns answer normalization, human-friendly variant generation, index construction, exact/alias lookup, and bounded Levenshtein matching.
- * Does not fetch SQLite chunks or manage round timers.
+ * Owns answer normalization, human-friendly variant generation, shard bucket routing, index construction, exact/alias lookup, and bounded Levenshtein matching.
+ * Does not fetch static shards or manage round timers.
  */
 import { TIERS } from './tiers';
 import type { AnswerEntry, MatchResult, Prompt } from './types';
@@ -131,7 +131,10 @@ const AFFIX_STOPWORDS = new Set([
   'grand', 'royal', 'king', 'queen', 'clear', 'salt', 'rock', 'pine',
 ]);
 
+const CLEAN_NORM_RE = /^[a-z0-9]+(?: [a-z0-9]+)*$/;
+
 export function normalizeAnswer(raw: string): string {
+  if (CLEAN_NORM_RE.test(raw)) return raw;
   return raw
     .normalize('NFD')
     .replace(/[\u0300-\u036f]/g, '')
@@ -257,7 +260,15 @@ export function fuzzyLookupKeys(stripped: string): { p3Keys: string[]; s3Key: st
   return { p3Keys: Array.from(p3Keys), s3Key };
 }
 
-function pluralVariants(norm: string): string[] {
+/** Route a normalized form to one of 27 static shard buckets (a..z or _). */
+export function bucketKeyForNorm(norm: string): string {
+  const stripped = stripLeadingArticle(norm) || norm;
+  const ch = stripped[0];
+  if (!ch) return '_';
+  return ch >= 'a' && ch <= 'z' ? ch : '_';
+}
+
+export function pluralVariants(norm: string): string[] {
   const out = [norm];
   const stripped = stripLeadingArticle(norm);
   if (stripped && stripped !== norm) {

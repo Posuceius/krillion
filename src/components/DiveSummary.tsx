@@ -1,5 +1,5 @@
 /**
- * Owns end-of-dive summary cards, clipboard sharing, SQLite tier browsing, and live answer search.
+ * Owns end-of-dive summary cards, clipboard sharing, tier browsing, and live answer search.
  * Does not run active round timers or persist logbook history.
  */
 import { useEffect, useState } from 'react';
